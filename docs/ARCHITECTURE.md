@@ -90,7 +90,7 @@ nothing may run before them — see **Platform** above.
 | --- | --- | --- |
 | Document source | `viewer/document.py` | `_DocumentSource`, `_resolve_password`, `EncryptedPdfError`; `_adopt_buffer`, `_buffer_watch` are on the window |
 | Rendering | `viewer/render.py`, `viewer/tasks.py` | `_render_targets`, `_pix_to_qimage`, `PixmapCache`, `_RenderTask` |
-| Content detection | `viewer/detect.py` | `detect_content_rect`, `_graphic_rects`, `_raster_content_rect`; `_ContentDetectTask` and `_GRAPHIC_DETECT_BUDGET_S` are in `tasks.py` |
+| Content detection | `viewer/detect.py` | `detect_content_rect`, `_graphic_rects`, `_raster_content_rect`; `_ContentDetectTask` and `_GRAPHIC_DETECT_BUDGET_S` are in `viewer/tasks.py` |
 | Rect math, boilerplate filter | `viewer/geometry.py` | `_union_rects`, `_pad_within_page`, `_is_boilerplate` |
 | One grid cell | `viewer/cell.py` | `PageCell` |
 | Persistence | `viewer/state.py` | `_state_file_path`, `_save_last_page` |
