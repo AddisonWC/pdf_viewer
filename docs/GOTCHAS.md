@@ -58,6 +58,14 @@ nothing" reports were binding-layer bugs with a perfectly good handler.
 
 ## Test suite
 
+- **Patch a function where it is *called*, not where it is defined.** Now that
+  the code is a package, `from .detect import detect_content_rect` binds the
+  name into `tasks`' globals, so patching `detect.detect_content_rect` does not
+  reach `_ContentDetectTask` — the test patches `tasks.detect_content_rect`.
+  `_graphic_rects` is the opposite case: `detect` calls it through its own
+  globals, so it must be patched on `detect`. Patching `shutil.which`,
+  `subprocess.Popen` or `threading.Thread` works from anywhere, because those
+  mutate an attribute on the shared stdlib module rather than rebinding a name.
 - **A stub with the wrong signature can "pass" through the exception path.** A
   `detect_content_rect` stub started raising `TypeError` when a kwarg appeared,
   and the test still passed because the exception path also yields no crop.
@@ -85,7 +93,9 @@ nothing" reports were binding-layer bugs with a perfectly good handler.
   to xcb.** `Could not load the Qt platform plugin "wayland" ... even though it
   was found`, then `abort` — so requesting it unconditionally makes the program
   refuse to start under X11, VNC and SSH X-forwarding. Hence the session check
-  at the top of `pdfviewer.py`.
+  in `viewer/__init__.py` — the package `__init__` because Python runs it before
+  any `viewer.*` submodule, so no import order inside the package can let
+  PySide6 load first. Anything added above that check must not import Qt.
 
 ## Qt window lifetime
 

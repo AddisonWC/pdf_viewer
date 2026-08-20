@@ -1,8 +1,14 @@
 # Architecture
 
-`pdfviewer.py` is the whole program: an M×N grid of PDF pages that slides
-forward one page at a time, on PySide6 and PyMuPDF, for reading dense papers and
-scanned books. It is one ~4k-line module — accretion, not a decision.
+An M×N grid of PDF pages that slides forward one page at a time, on PySide6 and
+PyMuPDF, for reading dense papers and scanned books.
+
+`pdfviewer.py` is the entry point and nothing else; the program is the `viewer`
+package beside it. The window class is still one ~2.4k-line class in
+`viewer/window.py` — its areas share one mutable view state (`cells`, `doc`,
+`first_page`, `crop_rect`, the generation counters), so they are not separable
+without redesigning that state. Splitting it further by moving methods to other
+files would hide that coupling rather than remove it.
 
 ---
 
@@ -56,7 +62,8 @@ subsystem they belong to.
   the final size is free and scaling softens pages; re-rendering per event is
   not free, and is throttled or debounced wherever it appears.
 - **Last-read-page persistence is best effort.** A missing or corrupt state file
-  must never break opening or closing a document.
+  must never break opening or closing a document. The write is atomic
+  (`_save_last_page`) because that one file holds every document's position.
 
 ## Platform
 
@@ -71,32 +78,42 @@ allow it and was rejected (`HISTORY.md`).
 
 ## Index
 
-Symbols to grep. What each area is shaped like, and which of it is Addison's
-spec, is in `SUBSYSTEMS.md`.
+Where each area lives and the symbols to grep for it. What an area is shaped
+like, and which of it is Addison's spec, is in `SUBSYSTEMS.md`.
 
-- **Document source** — `_DocumentSource`, `_adopt_buffer`, `_buffer_watch`,
-  `_resolve_password`, `EncryptedPdfError`.
-- **Rendering** — `_RenderTask`, `_render_targets`, `_pix_to_qimage`,
-  `_PIXMAP_CACHE_BUDGET_BYTES`.
-- **Content detection** — `detect_content_rect`, `_ContentDetectTask`,
-  `_graphic_rects`, `_raster_content_rect`, `_GRAPHIC_DETECT_BUDGET_S`.
-- **Overlays** — `_position_overlays`, `_raise_overlays`, `_render_status`,
-  `BUSY_FRAMES`.
+`pdfviewer.py` is the entry point only (`parse_args`, `main`); `pdfviewer_xcb.py`
+imports `main` from it. Importing the `viewer` package sets `QT_QPA_PLATFORM`
+and caps the thread pool, so `viewer/__init__.py` holds those two lines and
+nothing may run before them — see **Platform** above.
+
+| area | module | grep for |
+| --- | --- | --- |
+| Document source | `viewer/document.py` | `_DocumentSource`, `_resolve_password`, `EncryptedPdfError`; `_adopt_buffer`, `_buffer_watch` are on the window |
+| Rendering | `viewer/render.py`, `viewer/tasks.py` | `_render_targets`, `_pix_to_qimage`, `PixmapCache`, `_RenderTask` |
+| Content detection | `viewer/detect.py` | `detect_content_rect`, `_graphic_rects`, `_raster_content_rect`; `_ContentDetectTask` and `_GRAPHIC_DETECT_BUDGET_S` are in `tasks.py` |
+| Rect math, boilerplate filter | `viewer/geometry.py` | `_union_rects`, `_pad_within_page`, `_is_boilerplate` |
+| One grid cell | `viewer/cell.py` | `PageCell` |
+| Persistence | `viewer/state.py` | `_state_file_path`, `_save_last_page` |
+| Ask agent | `viewer/integrations.py` | `_launch_claude_helper`, `pdf_helper_prompt.txt` |
+| Tuning, theme, regexes | `viewer/constants.py` | `BUSY_FRAMES`, `_REF_MARKER`, `ZOOM_STEP` |
+| Help page | `viewer/help_text.py` | `HELP_HTML` |
+
+Everything below is on `PdfGridViewer` in `viewer/window.py`:
+
+- **Overlays** — `_position_overlays`, `_raise_overlays`, `_render_status`.
 - **Selection and clipboards** — `on_selection_changed`, `copy_selection`.
 - **Search** — `_navigate_search`, `_search_history_open`.
 - **Table of contents** — `_actual_toc_level`, `_begin_toc_nav`, and the `Y/U/I/O`
   comment block above them.
 - **Zoom, crop and gestures** — `zoom_at_focus`, `_handle_two_button_gesture`,
   `_take_saved_grid_dims`.
-- **Citations** — `_citation_number`, `_reference_text_at`, `_REF_MARKER`.
-- **Ask agent** — `_launch_claude_helper`, `pdf_helper_prompt.txt`.
-- **History, copies, persistence** — `open_copy`, `_align_over`,
-  `_state_file_path`.
+- **Citations** — `_citation_number`, `_reference_text_at`.
+- **History and copies** — `open_copy`, `_align_over`, `_push_history`.
 
 ## Testing
 
-`venv/bin/python test_pdfviewer.py` — a hand-rolled offscreen suite, 38 groups /
-192 checks, about 25 seconds, deterministic. Two layers: behavioural, driving the
+`venv/bin/python test_pdfviewer.py` — a hand-rolled offscreen suite, 43 groups /
+222 checks, about 30 seconds, deterministic. Two layers: behavioural, driving the
 widget through `QTest`, and internal-invariant, covering pixel math, cache
 eviction and staleness guards. It is entirely agent-built; Addison has not been
 involved in its design. Its traps, including the rule that a new regression test

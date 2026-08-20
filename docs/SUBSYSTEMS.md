@@ -21,10 +21,13 @@ already reports cleanly. Anything that opens a `fitz.Document` outside
 
 Background `QThreadPool` (`_RenderTask`), one `fitz.Document` per worker thread
 because MuPDF documents aren't thread-safe. Results carry generation tokens and
-the cell size they were dispatched for. A per-window pixmap LRU sits in front,
-budgeted by total bytes rather than entry count; the budget is an agent's pick
-and open to revision. Dark mode inverts HSL lightness rather than RGB — Addison
-asked for that after seeing colour figures come out as photo negatives.
+the cell size they were dispatched for. A per-window `PixmapCache` sits in
+front, budgeted by total bytes rather than entry count; the budget is an agent's
+pick and open to revision. The cache only stores — the keys that identify a
+render (crop generation, dark mode, DPR) are built by the window, in
+`_cache_key` and `_result_cache_key`. Dark mode inverts HSL lightness rather
+than RGB — Addison asked for that after seeing colour figures come out as photo
+negatives.
 
 ## Content detection
 

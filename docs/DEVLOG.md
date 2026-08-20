@@ -253,3 +253,55 @@ non-atomic state write in `_save_last_page`.
   are ignored; the small test PDFs and `designer_notes.txt` are tracked, so the
   notes travel with the repo to anyone it is shared with. Nothing in the program
   changed and nothing was measured.
+
+## 2026-08-19 (later still) — split into a package
+
+Acting on the outside review's "split the module" suggestion, and on three of
+its smaller ones. `docs/REVIEW-2026-08.md` records what was declined and why.
+
+- **`pdfviewer.py` (4149 lines) became `pdfviewer.py` (48) plus a `viewer`
+  package.** The UI-independent half came out first: an AST pass confirmed that
+  nothing below `PdfGridViewer` references `PdfGridViewer` or `PageCell`, so
+  detection, the document source, render math, the three tasks, persistence,
+  the Ask launcher, rect helpers, constants and `HELP_HTML` moved with no
+  dependency inversion. Module map is in `ARCHITECTURE.md`.
+- **The window class was not split, and that is a decision, not a leftover.**
+  Bucketing its 130 methods by area and measuring which instance attributes
+  cross buckets: 28 of 86 are touched by three or more areas — `cells` by 8,
+  `doc` and `first_page` by 7, `page_count` by 6, `crop_rect`,
+  `crop_source_rect`, `_source`, `_crop_generation` and `cols` by 5. Search,
+  crop and rendering are not separate concerns in that class; they are views
+  onto one mutable view state. Mixins would have moved the lines without
+  touching the coupling.
+- **`PixmapCache` was the exception** and came out as a real object:
+  `_pixmap_cache` and `_pixmap_cache_bytes` were touched only by `_cache_get`,
+  `_cache_put` and `__init__`, nowhere else in 4149 lines. The window keeps key
+  construction (`_cache_key`, `_result_cache_key`), which reads window state.
+- **The move was verified, not just tested.** A script compared every top-level
+  symbol's source text before and after: 83 identical, none missing, and the
+  only diffs were the five intended ones. `PdfGridViewer`'s own diff is the
+  cache swap and nothing else.
+- **Atomic state write.** `_save_last_page` writes a temp file in the state
+  directory and `os.replace`s it, cleaning the temp up if the rename fails.
+  That file holds *every* document's position, so the previous in-place
+  truncate-and-write risked losing all of them.
+- **`requirements.txt` now has ranges.** Upper bounds at the next major; floors
+  are explicitly marked in the file as unverified, since nobody has run the
+  suite against old releases.
+- **Two hazards the split introduced, both now covered by tests.**
+  `_launch_claude_helper` locates `pdf_helper_prompt.txt` via `__file__`, which
+  moved down a directory — a wrong path there fails silently at the far end of
+  a terminal launch. And `pdfviewer_xcb.py` does `from pdfviewer import main`.
+  `test_entry_point_and_helper_prompt_paths` asserts both, and asks the
+  launcher what path it passes rather than recomputing it.
+- **The import-binding trap cost a test failure immediately.**
+  `test_failed_detection_still_zooms_out` patched `detect.detect_content_rect`,
+  which no longer reaches `_ContentDetectTask` because `tasks` bound the name at
+  import. Patched on `tasks` instead; the rule is in `GOTCHAS.md`.
+- **Suite: 38 groups / 192 checks → 43 / 222, ~29 s** (Addison's machine, same
+  offscreen platform). Four new groups: stale-generation render drop,
+  search-refine history fold, atomic state write, entry-point and helper paths.
+  Each was confirmed to fail against a mutation of the logic it guards — the
+  first drafts of two of them survived their mutants and were rewritten (the
+  history one only checked Back's destination, which the mutant preserves; the
+  path one recomputed the path instead of reading it off the launch argv).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offscreen regression tests for pdfviewer.py.
+"""Offscreen regression tests for the viewer.
 
 Runs the viewer under Qt's headless "offscreen" platform and drives its
 features directly (and via synthesized key/mouse events), asserting on the
@@ -12,6 +12,7 @@ collapse + restore, search, and TOC behaviour.
 Exits non-zero if any check fails.
 """
 import os
+import re
 import sys
 import tempfile
 import time
@@ -30,6 +31,7 @@ from PySide6.QtGui import QShortcut, QImage, QPixmap, QMouseEvent, QClipboard
 from PySide6.QtTest import QTest
 
 import pdfviewer
+from viewer import constants, detect, document, integrations, render, tasks, window
 
 APP = QApplication.instance() or QApplication(["test"])
 
@@ -253,7 +255,7 @@ _make_image_figure_pdf(IMAGE_FIGURE_PDF)
 
 
 def new_viewer(path, rows=1, cols=1):
-    v = pdfviewer.PdfGridViewer(path, rows=rows, cols=cols)
+    v = window.PdfGridViewer(path, rows=rows, cols=cols)
     v.resize(1000, 800)
     v.show()
     pump()
@@ -326,7 +328,7 @@ def test_cursor_zoom():
     c1 = v.crop_rect
     check("zoom in sets a crop", c1 is not None)
     ratio = full / c1.width if c1 else 0
-    check("one zoom-in step ~= ZOOM_STEP", abs(ratio - pdfviewer.ZOOM_STEP) < 0.02)
+    check("one zoom-in step ~= ZOOM_STEP", abs(ratio - constants.ZOOM_STEP) < 0.02)
     for _ in range(30):
         v.zoom_out_step(); pump(4)
     check("zooming all the way out clears the crop", v.crop_rect is None)
@@ -444,7 +446,7 @@ def test_search_escape_cancels_inflight_result():
     inflight_gen = v._search_generation
     start_page = v.first_page
     QTest.keyClick(v, Qt.Key_Escape); pump()
-    late = pdfviewer._SearchResult(inflight_gen, [(6, fitz.Rect(72, 72, 200, 90))])
+    late = tasks._SearchResult(inflight_gen, [(6, fitz.Rect(72, 72, 200, 90))])
     v._on_search_done(late); pump()
     check("late result after Escape is discarded", not v._search_matches)
     check("late result after Escape does not navigate", v.first_page == start_page)
@@ -502,9 +504,11 @@ def test_wayland_only_requested_in_a_wayland_session():
     # aborts at startup, so an unconditional default stops the viewer running
     # under X11, VNC and SSH X-forwarding at all.
     import subprocess
-    probe = ("import os, sys; sys.argv = ['pdfviewer.py', 'x.pdf'];"
+    # The gate lives in viewer/__init__.py, which Python runs before any
+    # viewer.* submodule, so importing the package is what has to be probed.
+    probe = ("import os, sys;"
              "sys.path.insert(0, %r);"
-             "import pdfviewer;"
+             "import viewer;"
              "print(os.environ.get('QT_QPA_PLATFORM'))" % os.path.dirname(os.path.abspath(__file__)))
 
     def platform_for(env):
@@ -610,7 +614,7 @@ def test_dark_mode_pixel_math():
     # colour figures don't come out as photo negatives. Grayscale degenerates
     # to plain inversion (black text <-> white text).
     arr = np.array([[[0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 0, 139]]], dtype=np.uint8)
-    img = pdfviewer._pix_to_qimage(_FakePix(arr), dark=True)
+    img = render._pix_to_qimage(_FakePix(arr), dark=True)
 
     def px(x):
         c = img.pixelColor(x, 0)
@@ -620,7 +624,7 @@ def test_dark_mode_pixel_math():
     check("dark: white -> black", px(1) == (0, 0, 0))
     check("dark: pure red preserved (hue kept)", px(2) == (255, 0, 0))
     check("dark: dark blue -> light blue (hue kept)", px(3) == (116, 116, 255))
-    light = pdfviewer._pix_to_qimage(_FakePix(arr), dark=False)
+    light = render._pix_to_qimage(_FakePix(arr), dark=False)
     lc = light.pixelColor(2, 0)
     check("light: passthrough unchanged", (lc.red(), lc.green(), lc.blue()) == (255, 0, 0))
 
@@ -629,23 +633,21 @@ def test_pixmap_cache_invariants():
     v = new_viewer(PLAIN_PDF, 1, 1)
     key = v._cache_key(0, 100, 100)
     check("cache key is a 6-tuple", len(key) == 6)
-    check("cache key carries DPR", key[5] == pdfviewer._dpr_key(v._dpr()))
+    check("cache key carries DPR", key[5] == render._dpr_key(v._dpr()))
     # Byte-budget eviction: many pixmaps far exceeding the budget must evict
     # oldest-first while keeping the cache under budget.
     v._pixmap_cache.clear()
-    v._pixmap_cache_bytes = 0
     big = QPixmap(3000, 3000)  # ~36 MB at 32bpp
     for i in range(10):        # ~360 MB total, well over the 256 MB budget
-        v._cache_put(("fake", i), big)
+        v._pixmap_cache.put(("fake", i), big)
     check("byte budget keeps cache under budget",
-          v._pixmap_cache_bytes <= pdfviewer._PIXMAP_CACHE_BUDGET_BYTES)
+          v._pixmap_cache.total_bytes <= render._PIXMAP_CACHE_BUDGET_BYTES)
     check("newest survives, oldest evicted",
           ("fake", 9) in v._pixmap_cache and ("fake", 0) not in v._pixmap_cache)
     huge = QPixmap(9000, 9000)  # ~324 MB alone -- larger than the whole budget
-    v._cache_put(("huge", 0), huge)
+    v._pixmap_cache.put(("huge", 0), huge)
     check("single over-budget pixmap still cached", ("huge", 0) in v._pixmap_cache)
     v._pixmap_cache.clear()
-    v._pixmap_cache_bytes = 0
     # render_page reads the cache now (it used to only ever write it).
     pm1 = v.render_page(0, QSize(400, 500))
     pm2 = v.render_page(0, QSize(400, 500))
@@ -663,7 +665,7 @@ def test_stale_render_does_not_clobber():
     check("cell has a crisp render to protect", crisp is not None)
     stale = QImage(50, 60, QImage.Format_RGB888)
     stale.fill(Qt.red)
-    result = pdfviewer._RenderResult(
+    result = tasks._RenderResult(
         "visible", v._render_generation, 0, cell.page_idx,
         50, 60, v._crop_generation, v.dark_mode, v._dpr(), stale, None)
     v._render_inflight = 1
@@ -772,8 +774,8 @@ def test_center_drag_pan_and_click():
 def test_citation_to_web_search():
     v = new_viewer(CITATION_PDF, 1, 1)
     captured = []
-    orig = pdfviewer.QDesktopServices.openUrl
-    pdfviewer.QDesktopServices.openUrl = lambda url: captured.append(url.toString())
+    orig = window.QDesktopServices.openUrl
+    window.QDesktopServices.openUrl = lambda url: captured.append(url.toString())
     try:
         link = v.link_at(0, (195, 100))  # over the citation link rect on page 0
         check("link_at finds the citation link", link is not None)
@@ -787,7 +789,7 @@ def test_citation_to_web_search():
         check("Scholar query does not bleed into the previous entry", url is not None and "Lovelace" not in url)
         check("Scholar query does not bleed into the next entry", url is not None and "Turing" not in url)
     finally:
-        pdfviewer.QDesktopServices.openUrl = orig
+        window.QDesktopServices.openUrl = orig
     # The citation number wins over a misleading destination point: a point
     # aimed at entry [1] but number=2 must still return entry [2] (the real
     # "completely incorrect numbers" fix), while number=None falls back to the
@@ -831,15 +833,15 @@ def test_ask_claude_launcher():
     # argv instead of spawning a real terminal.
     v = new_viewer(PLAIN_PDF, 1, 1); pump()
     captured = {}
-    orig_which = pdfviewer.shutil.which
-    orig_popen = pdfviewer.subprocess.Popen
-    pdfviewer.shutil.which = lambda name: "/usr/bin/" + name
+    orig_which = integrations.shutil.which
+    orig_popen = integrations.subprocess.Popen
+    integrations.shutil.which = lambda name: "/usr/bin/" + name
 
     def fake_popen(argv, **kw):
         captured["argv"] = argv
         return object()
 
-    pdfviewer.subprocess.Popen = fake_popen
+    integrations.subprocess.Popen = fake_popen
     try:
         QTest.keyClick(v, Qt.Key_Question); pump()
         check("? shows the Ask Claude box", v.ask_overlay.isVisible())
@@ -873,8 +875,8 @@ def test_ask_claude_launcher():
         check("Escape hid the Ask box", not v.ask_overlay.isVisible())
         check("Escape did not launch", "argv" not in captured)
     finally:
-        pdfviewer.shutil.which = orig_which
-        pdfviewer.subprocess.Popen = orig_popen
+        integrations.shutil.which = orig_which
+        integrations.subprocess.Popen = orig_popen
     v.close()
 
 
@@ -959,9 +961,9 @@ def test_encrypted_pdf_unlocks_everywhere():
         asked.append(again)
         return "wrong" if len(asked) == 1 else "hunter2"   # first try is wrong
 
-    source = pdfviewer._DocumentSource(path, ask_password=ask)
+    source = document._DocumentSource(path, ask_password=ask)
     check("prompted, then re-prompted after a wrong password", asked == [False, True])
-    v = pdfviewer.PdfGridViewer(path, rows=1, cols=2, source=source)
+    v = window.PdfGridViewer(path, rows=1, cols=2, source=source)
     v.resize(1000, 800); v.show(); pump()
     check("encrypted document opens once unlocked", v.page_count == 12)
 
@@ -1000,9 +1002,9 @@ def test_encrypted_pdf_unlocks_everywhere():
 
     # Giving up at the prompt is a clean refusal, not a window full of errors.
     try:
-        pdfviewer._DocumentSource(path, ask_password=lambda p, again: None)
+        document._DocumentSource(path, ask_password=lambda p, again: None)
         refused = None
-    except pdfviewer.EncryptedPdfError as exc:
+    except document.EncryptedPdfError as exc:
         refused = str(exc)
     check("cancelling the prompt raises a clear error",
           refused is not None and "password" in refused.lower())
@@ -1036,12 +1038,12 @@ def test_buffer_survives_move_during_load():
         def start(self):
             pending.append(self._target)
 
-    orig_thread = pdfviewer.threading.Thread
-    pdfviewer.threading.Thread = _HeldThread
+    orig_thread = document.threading.Thread
+    document.threading.Thread = _HeldThread
     try:
-        source = pdfviewer._DocumentSource(src)
+        source = document._DocumentSource(src)
     finally:
-        pdfviewer.threading.Thread = orig_thread
+        document.threading.Thread = orig_thread
     check("usable before the buffer lands", not source.ready and source.open().page_count == 8)
 
     os.rename(src, gone)   # file moves mid-load...
@@ -1071,7 +1073,7 @@ def test_scanned_page_content_crop():
     doc = fitz.open(SCAN_PDF)
     page = doc.load_page(0)
     check("scan really has no text layer", len(page.get_text("blocks")) == 0)
-    r = pdfviewer.detect_content_rect(page)
+    r = detect.detect_content_rect(page)
     check("scan gets a content rect anyway", r is not None)
     if r is not None:
         pr = page.rect
@@ -1098,7 +1100,7 @@ def test_content_crop_keeps_figures():
     # crop down to its caption and cut the figure off entirely.
     doc = fitz.open(FIGURE_PDF)
     page = doc.load_page(0)
-    r = pdfviewer.detect_content_rect(page)
+    r = detect.detect_content_rect(page)
     check("figure page gets a content rect", r is not None)
     if r is not None:
         check("crop starts above the figure, not at the caption", r.y0 < 100)
@@ -1134,7 +1136,7 @@ def test_graphic_rects_bucketing():
                                               # sneak past that)
     ]
     got = sorted(tuple(round(v, 3) for v in r)
-                 for r in pdfviewer._graphic_rects(_StubPage(pr, marks)))
+                 for r in detect._graphic_rects(_StubPage(pr, marks)))
     want = sorted([
         (10.0, 10.0, 40.0, 40.0),
         (150.0, 150.0, 160.0, 160.0),
@@ -1153,7 +1155,7 @@ def test_graphic_rects_bucketing():
             for i in range(200000)]
     page = _StubPage(pr, bulk)
     t0 = time.perf_counter()
-    rects = pdfviewer._graphic_rects(page)
+    rects = detect._graphic_rects(page)
     elapsed = time.perf_counter() - t0
     print(f"       ({len(bulk)} marks in {1000 * elapsed:.0f} ms)")
     check("200k marks stay well under half a second", elapsed < 0.5)
@@ -1181,10 +1183,10 @@ def test_dense_figure_page_detects_promptly():
     bboxlog_cost = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    r = pdfviewer.detect_content_rect(page, allow_raster=False)
+    r = detect.detect_content_rect(page, allow_raster=False)
     with_graphics = time.perf_counter() - t0
     t0 = time.perf_counter()
-    pdfviewer.detect_content_rect(page, allow_raster=False, allow_graphics=False)
+    detect.detect_content_rect(page, allow_raster=False, allow_graphics=False)
     without_graphics = time.perf_counter() - t0
 
     surcharge = with_graphics - without_graphics
@@ -1210,7 +1212,7 @@ def test_image_figure_counts_as_content():
     blocks = [b for b in page.get_text("blocks") if b[4].strip()]
     check("only the caption is extractable as text", len(blocks) == 1)
     check("caption sits below the image", blocks[0][1] > 340)
-    r = pdfviewer.detect_content_rect(page, allow_raster=False)
+    r = detect.detect_content_rect(page, allow_raster=False)
     check("image figure page gets a content rect", r is not None)
     if r is not None:
         check("crop starts at the image, not the caption", r.y0 < 100)
@@ -1224,14 +1226,14 @@ def test_graphic_detect_budget_stops_scanning():
     # figures once it has spent its budget -- but never before the first
     # page, so a single-page Shift+C is never silently degraded.
     calls = []
-    real = pdfviewer._graphic_rects
+    real = detect._graphic_rects
 
     def slow(page):
         calls.append(1)
-        time.sleep(pdfviewer._GRAPHIC_DETECT_BUDGET_S * 0.6)
+        time.sleep(tasks._GRAPHIC_DETECT_BUDGET_S * 0.6)
         return real(page)
 
-    pdfviewer._graphic_rects = slow
+    detect._graphic_rects = slow
     try:
         v = new_viewer(PLAIN_PDF, 1, 1)
         pump(60)
@@ -1246,7 +1248,7 @@ def test_graphic_detect_budget_stops_scanning():
         check("the crop still landed", v.crop_rect is not None)
         v.close()
     finally:
-        pdfviewer._graphic_rects = real
+        detect._graphic_rects = real
 
 
 def test_failed_detection_still_zooms_out():
@@ -1255,12 +1257,16 @@ def test_failed_detection_still_zooms_out():
     # the view untouched is what made it look broken on scans.
     v = new_viewer(PLAIN_PDF, 1, 1)
     pump(60)
-    orig = pdfviewer.detect_content_rect
+    # Patched on tasks, not on detect: _ContentDetectTask imported the name,
+    # so it resolves through tasks' globals and a patch on detect would not
+    # reach it. (_graphic_rects above is different -- detect calls that one
+    # through its own globals, so it must be patched on detect.)
+    orig = tasks.detect_content_rect
     # **kw, so this stub keeps standing in for the real signature as its
     # opt-out flags (allow_raster, allow_graphics) come and go -- a stub
     # that raises TypeError instead would still leave fractions=None and
     # so would still "pass" this test, silently testing the wrong path.
-    pdfviewer.detect_content_rect = lambda page, **kw: None
+    tasks.detect_content_rect = lambda page, **kw: None
     try:
         v._zoom_focus = (v.first_page, 0.5, 0.5)
         v.zoom_in_step(); pump(60)
@@ -1269,7 +1275,7 @@ def test_failed_detection_still_zooms_out():
         check("failed detection drops the crop", v.crop_rect is None)
         check("failed detection clears the crop source", v.crop_source_rect is None)
     finally:
-        pdfviewer.detect_content_rect = orig
+        tasks.detect_content_rect = orig
     v.close()
 
 
@@ -1307,14 +1313,14 @@ def test_busy_indicator_follows_the_page_numbers():
     text = v.status_overlay.text()
     check("busy counter still starts with the range", text.startswith(v._status_text))
     check("first frame is drawn after the numbers",
-          pdfviewer.BUSY_FRAMES[0] in text[len(v._status_text):])
+          constants.BUSY_FRAMES[0] in text[len(v._status_text):])
     v._advance_busy_frame()
     stepped = v.status_overlay.text()
-    check("a tick changes the frame", pdfviewer.BUSY_FRAMES[1] in stepped)
+    check("a tick changes the frame", constants.BUSY_FRAMES[1] in stepped)
     check("stepping still leaves the numbers first", stepped.startswith(v._status_text))
-    for _ in range(len(pdfviewer.BUSY_FRAMES) - 1):
+    for _ in range(len(constants.BUSY_FRAMES) - 1):
         v._advance_busy_frame()
-    check("frames wrap back round", pdfviewer.BUSY_FRAMES[0] in v.status_overlay.text())
+    check("frames wrap back round", constants.BUSY_FRAMES[0] in v.status_overlay.text())
     check("indicator steps twice a second", v._busy_timer.interval() == 500)
     v._refresh_loading_indicator()
     check("timer runs exactly while there is work", v._busy_timer.isActive() == v._loading)
@@ -1349,6 +1355,147 @@ def test_selection_uses_primary_and_ctrl_c_uses_clipboard():
           clipboard.text(QClipboard.Clipboard) == "query text")
     v._on_escape(); pump()
     v.close()
+
+
+def test_stale_generation_render_is_dropped():
+    # Async cancellation: a render dispatched before a page move must not
+    # paint after it. The size guard (above) doesn't cover this -- a late
+    # result can carry exactly the right size and still be for the old view.
+    v = new_viewer(PLAIN_PDF, 1, 1)
+    pump(60)
+    cell = v.cells[0]
+    crisp = cell._page_pixmap
+    check("cell has a render to protect", crisp is not None)
+    size = cell.size()
+    stale = QImage(size.width(), size.height(), QImage.Format_RGB888)
+    stale.fill(Qt.red)
+    inflight = v._render_inflight
+    result = tasks._RenderResult(
+        "visible", v._render_generation - 1, 0, cell.page_idx,
+        size.width(), size.height(), v._crop_generation, v.dark_mode,
+        v._dpr(), stale, None)
+    v._on_render_done(result)
+    check("superseded generation does not repaint the cell",
+          cell._page_pixmap is crisp)
+    # The in-flight count belongs to the current generation, so a stale
+    # arrival must not decrement it -- that would strand the busy spinner.
+    check("superseded generation does not touch the in-flight count",
+          v._render_inflight == inflight)
+    v.close()
+
+
+def test_search_refine_keeps_one_back_target():
+    # A whole search session folds into ONE Back target: the page search was
+    # opened from. Refining the query rewrites the landing entry in place
+    # rather than pushing a second one, so Back after two matches still lands
+    # on the pre-search page and not on the first match.
+    v = new_viewer(PLAIN_PDF, 1, 1)
+    v.jump_to_page(1, animate=False); pump()
+    origin = v.first_page
+    QTest.keyClick(v, Qt.Key_Slash); pump()
+
+    def type_and_wait(text):
+        # Wait for the search for THIS query to complete: _search_matches is
+        # not cleared between queries, so polling it alone returns the
+        # previous query's results immediately and tests nothing.
+        v.search_input.setText(text)
+        v._on_search_text_changed(text)
+        for _ in range(300):
+            APP.processEvents(); time.sleep(0.003)
+            if (v._last_search_query == text and not v._search_inflight
+                    and v._search_matches):
+                pump()
+                return True
+        return False
+
+    check("first query matched", type_and_wait("Page 12"))
+    first_landing = v.first_page
+    depth_after_first = len(v._history)
+    pos_after_first = v._history_pos
+    check("refined query matched", type_and_wait("Page 15"))
+    second_landing = v.first_page
+    check("refining moved the view again", second_landing != first_landing)
+    # The heart of the fold: the refined landing REPLACES the previous one
+    # rather than being pushed on top of it. Without this, Back/Forward walk
+    # every intermediate match a reader typed through.
+    check("refining does not deepen the history",
+          len(v._history) == depth_after_first)
+    check("refining does not advance the history position",
+          v._history_pos == pos_after_first)
+    check("the history entry now holds the refined landing",
+          v._history[v._history_pos] == second_landing)
+    QTest.keyClick(v, Qt.Key_Return); pump()
+    v.history_back(); pump()
+    check("one Back returns to the pre-search page (not the first match)",
+          v.first_page == origin)
+    v.history_forward(); pump()
+    check("Forward lands on the refined match, not the first one",
+          v.first_page == second_landing)
+    v.close()
+
+
+def test_last_page_state_write_is_atomic():
+    # The state file holds EVERY document's saved position, so writing it in
+    # place risks losing all of them. A failed write must leave the previous
+    # file intact and not litter the directory with temp files.
+    from viewer import state
+    path = state._state_file_path()
+    state._save_last_page("/tmp/doc_a.pdf", 4)
+    state._save_last_page("/tmp/doc_b.pdf", 9)
+    check("both documents saved", state._load_last_page("/tmp/doc_b.pdf") == 9)
+    before = open(path).read()
+
+    # Fail the rename, i.e. after the temp file is fully written.
+    orig_replace = os.replace
+    os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))
+    try:
+        state._save_last_page("/tmp/doc_c.pdf", 1)  # must not raise
+    finally:
+        os.replace = orig_replace
+    check("a failed save leaves the previous file byte-identical",
+          open(path).read() == before)
+    check("the earlier positions are still readable",
+          state._load_last_page("/tmp/doc_a.pdf") == 4)
+    leftovers = [f for f in os.listdir(os.path.dirname(path)) if f.endswith(".tmp")]
+    check("a failed save leaves no temp file behind", leftovers == [])
+    # And a normal save still lands.
+    state._save_last_page("/tmp/doc_c.pdf", 1)
+    check("a later save succeeds normally", state._load_last_page("/tmp/doc_c.pdf") == 1)
+
+
+def test_entry_point_and_helper_prompt_paths():
+    # Two things the rest of the suite would not notice if they broke: the
+    # entry point's public surface (pdfviewer_xcb.py does `from pdfviewer
+    # import main`) and the location of pdf_helper_prompt.txt, which is read
+    # at the far end of a terminal launch where a wrong path is silent.
+    check("entry point still exports main", callable(pdfviewer.main))
+    check("entry point still exports PdfGridViewer",
+          pdfviewer.PdfGridViewer is window.PdfGridViewer)
+    check("pdfviewer_xcb.py's import still resolves",
+          "from pdfviewer import main" in open(
+              os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "pdfviewer_xcb.py")).read())
+    # Ask the launcher what path it actually passes, rather than recomputing
+    # it here -- recomputing would agree with a wrong implementation.
+    captured = {}
+    orig_which, orig_popen = integrations.shutil.which, integrations.subprocess.Popen
+    integrations.shutil.which = lambda name: "/usr/bin/" + name
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = argv
+        return type("P", (), {"pid": 1})()
+
+    integrations.subprocess.Popen = fake_popen
+    try:
+        integrations._launch_claude_helper(PLAIN_PDF, "hello")
+    finally:
+        integrations.shutil.which = orig_which
+        integrations.subprocess.Popen = orig_popen
+    inner = captured.get("argv", ["", "", "", "", ""])[-1]
+    m = re.search(r"--append-system-prompt-file (\S+)", inner)
+    check("the launcher passes a helper-prompt path", m is not None)
+    check("the path it passes actually exists",
+          bool(m) and os.path.exists(m.group(1).strip("'\"")))
 
 
 def main():
@@ -1392,6 +1539,10 @@ def main():
         test_document_survives_file_moved,
         test_buffer_survives_move_during_load,
         test_encrypted_pdf_unlocks_everywhere,
+        test_stale_generation_render_is_dropped,
+        test_search_refine_keeps_one_back_target,
+        test_last_page_state_write_is_atomic,
+        test_entry_point_and_helper_prompt_paths,
     ]
     for t in tests:
         print(f"\n== {t.__name__} ==")

@@ -1,3 +1,17 @@
-PySide6
-PyMuPDF
-numpy
+# Ranges, not exact pins: this is a desktop program people run from a checkout,
+# and hard pins would fight whatever their distro already installed. The upper
+# bounds only exist so a new major release can't land silently on a colleague's
+# machine; the code is written against these majors, not tested beyond them.
+#
+# Known good, and what the numbers below were measured on:
+#   PySide6 6.11.1, PyMuPDF 1.28.0, numpy 2.5.1, Python 3.14.7
+#
+# The floors are NOT verified by testing against old releases -- nobody has run
+# the suite on them. They are conservative marks for the APIs actually used:
+# the Qt 6 widget/QRunnable API throughout, PyMuPDF's page.get_bboxlog() (the
+# vector-graphics pass in viewer/detect.py, and the newest thing used here),
+# and ordinary ndarray arithmetic on np.frombuffer views. Lower them only with
+# a green run to back it up.
+PySide6>=6.4,<7
+PyMuPDF>=1.22,<2
+numpy>=1.21,<3

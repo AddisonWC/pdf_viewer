@@ -53,8 +53,8 @@ the same edit. Then:
 - `ARCHITECTURE.md`, when the change binds agents working elsewhere in the
   program — a new invariant, or a principle Addison has stated.
 - `DEVLOG.md`, every session, one entry.
-- `HELP_HTML` in `pdfviewer.py`, for any key that changed. It is hand-written and
-  drifts silently.
+- `HELP_HTML` in `viewer/help_text.py`, for any key that changed. It is
+  hand-written and drifts silently.
 - `GOTCHAS.md`, when library or platform behavior cost you debugging time.
 - `HISTORY.md`, rarely: when a later agent would otherwise retry something that
   already failed, or revert something for the reason it was already rejected. Under
