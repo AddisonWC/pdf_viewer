@@ -112,9 +112,11 @@ Everything below is on `PdfGridViewer` in `viewer/window.py`:
 
 ## Testing
 
-`venv/bin/python test_pdfviewer.py` — a hand-rolled offscreen suite, 43 groups /
-222 checks, about 30 seconds, deterministic. Two layers: behavioural, driving the
+`venv/bin/python tests/test_pdfviewer.py` — a hand-rolled offscreen suite, 43 groups /
+222 checks, about 20 seconds, deterministic. Two layers: behavioural, driving the
 widget through `QTest`, and internal-invariant, covering pixel math, cache
 eviction and staleness guards. It is entirely agent-built; Addison has not been
-involved in its design. Its traps, including the rule that a new regression test
-must be confirmed to fail against the pre-fix logic, are in `GOTCHAS.md`.
+involved in its design. It generates all seven of its fixtures with PyMuPDF at
+import and reads nothing off disk, so it has no coverage of the I/O path. Its
+traps, including the rule that a new regression test must be confirmed to fail
+against the pre-fix logic, are in `GOTCHAS.md`.

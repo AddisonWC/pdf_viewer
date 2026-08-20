@@ -4,10 +4,20 @@
 > unreproducible.** Fedora/GNOME on native Wayland, mixed-DPI dual monitor
 > (1.0 and 1.25 scale), 16 cores, btrfs `compress=zstd:1` on NVMe with `/home`
 > ~95% full — **cold reads ~25 MB/s, warm ~1.8 GB/s**, which is unusually slow
-> and is why several designs exist at all. Test files are 300–660 MB scanned
-> textbooks in Addison's own library and won't exist for anyone else. Treat the
-> figures as evidence about *mechanism* and as ratios; re-measure before
-> calling anything a regression.
+> and is why several designs exist at all. Treat the figures as evidence about
+> *mechanism* and as ratios; re-measure before calling anything a regression.
+>
+> **Which PDFs a number came from matters, and this note used to conflate
+> three sources.** The cold-read figures come from *one* large scanned textbook
+> (a few hundred MB) in Addison's own library — that file is what the read-path
+> and buffering work was measured against, and it won't exist for anyone else.
+> Other behaviour has been checked by hand against assorted real PDFs from the
+> same library, which is where most real-world rendering and layout problems
+> have surfaced; those runs are manual and unrecorded. The automated suite uses
+> neither: it generates every fixture with PyMuPDF at import, ~1.1 MB total,
+> written and then read straight back, so it never performs a cold read and
+> has no coverage of the I/O path at all. Say which of the three a number came
+> from when you add one.
 
 New entries go at the bottom.
 
@@ -305,3 +315,47 @@ its smaller ones. `docs/REVIEW-2026-08.md` records what was declined and why.
   first drafts of two of them survived their mutants and were rewritten (the
   history one only checked Back's destination, which the mutant preserves; the
   path one recomputed the path instead of reading it off the launch argv).
+
+## 2026-08-19 (later)
+
+- **`pump()` no longer spins a fixed budget.** It was 40 iterations of
+  `processEvents()` + `time.sleep(0.003)` unconditionally, 187 calls per run:
+  **25.8 s of the 29.4 s total was inside pump**, against 7 s of CPU. The rest
+  was the main thread sleeping on work that had already landed. It now tracks an
+  idle streak and returns once nothing is outstanding.
+- **Three idle signals were not enough.** Events-processed + pool
+  `activeThreadCount` + `threading.active_count()` got the run to 16.6 s but
+  broke `test_buffer_survives_move_during_load`: `_buffer_watch` (150 ms) was
+  armed and unfired, so the loop looked idle while the result was still one
+  timeout away. Armed `QTimer`s now count as work outstanding. Rule in
+  `GOTCHAS.md`.
+- **The timer scan is per-decision, not per-iteration.** `findChildren(QTimer)`
+  over the widget tree cost ~30 ms per pump when run on every idle iteration
+  (21.5 s); moving it to fire only after a streak has elapsed gave 20.4 s. Small
+  next to the main win, and it caps the scan at `n/quiet` calls.
+- **29.8 s → 20.4 s, 222/222 checks unchanged.** The residual is honest: the
+  8 ms page-slide tick and the 500 ms busy timer are legitimately armed during
+  those tests, so those pumps correctly wait out the full budget. Getting below
+  this means per-call-site conditions, not a smarter `pump`.
+- **Verified against flakiness, since early exit trades time for a race.** Five
+  consecutive runs clean and tightly grouped (20.41–20.54 s), then three more
+  clean under three spinning CPU hogs — the case where a premature return would
+  show. 8/8.
+- **The suite moved to `tests/`,** unchanged otherwise: still one file, still
+  the hand-rolled `check`/`main()` harness. The four root `*_test.pdf` files
+  were deleted rather than moved: 26 KB referenced by nothing — not the suite,
+  which builds every fixture with PyMuPDF at import, and not the docs (Addison
+  confirmed they are not used for manual spot-checks either). Still in history.
+- **The move exposed a latent cwd dependency, which is the reason to run it
+  from more than one directory.** `test_wayland_only_requested_in_a_wayland_session`
+  builds a subprocess probe that injects `dirname(__file__)` into `sys.path` to
+  `import viewer`. That path is now `tests/`, not the repo root — but the test
+  still passed from the repo root, because the cwd supplied `viewer/` regardless.
+  It failed 5 checks from any other cwd. Both it and the `pdfviewer_xcb.py`
+  lookup in `test_entry_point_and_helper_prompt_paths` now use `REPO_ROOT`.
+  Verified 222/222 from the repo root, from inside `tests/`, and from `$HOME`.
+- **The header note at the top of this file was rewritten.** It had collapsed
+  three different PDF sources into one claim that "test files" are 300–660 MB
+  scanned textbooks. Corrected by Addison: the cold-read figures come from a
+  single large scanned textbook, other behaviour has been checked by hand
+  against assorted real PDFs, and the automated suite uses neither.

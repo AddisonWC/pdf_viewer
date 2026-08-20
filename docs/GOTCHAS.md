@@ -72,6 +72,23 @@ nothing" reports were binding-layer bugs with a perfectly good handler.
   **The other stubs have not been audited for this.**
 - **Confirm every new regression test fails against the pre-fix logic.** Two here
   would otherwise have been vacuous.
+- **`pump()` exits early only when nothing is outstanding, and an armed
+  `QTimer` counts.** It watches three things: events processed, the global
+  `QThreadPool` (`activeThreadCount`), and `threading.active_count() > 1` for
+  the document slurp thread. Those three alone are not enough — dropping the
+  timer check makes `test_buffer_survives_move_during_load` fail, because
+  `_buffer_watch` (150 ms) had not fired yet. Debounces run to 500 ms, well past
+  the 10-iteration idle streak, so any armed timer has to hold pump() open. The
+  timer scan walks the widget tree, so it runs only at the decision point, never
+  per iteration. `pump(n, quiet=n+1)` restores the old unconditional spin if a
+  test ever needs it.
+- **The suite lives in `tests/` but tests the package above it.** `REPO_ROOT`
+  (top of the file) is on `sys.path` for that reason, and anything reaching for
+  a repo-root file must go through it — `dirname(__file__)` is now `tests/`.
+  That bit the Wayland probe, which injects a path into a subprocess so it can
+  `import viewer`: it passed from the repo root, where the cwd supplied the
+  package anyway, and failed from every other cwd. Run from somewhere else
+  before trusting a path change here.
 - **The suite sets `XDG_STATE_HOME` to a temp dir.** Last-read-page persistence
   is real global on-disk state and leaks between runs otherwise.
 - **`page.draw_rect` commits a whole `Shape` per call** — 24 000 calls takes over

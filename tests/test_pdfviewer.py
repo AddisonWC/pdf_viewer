@@ -7,7 +7,7 @@ resulting state. Not a pixel test -- it can't judge how things look -- but it
 catches crashes and logic regressions in navigation, zoom/crop, the box-zoom
 collapse + restore, search, and TOC behaviour.
 
-    python test_pdfviewer.py        # or: venv/bin/python test_pdfviewer.py
+    python tests/test_pdfviewer.py  # or: venv/bin/python tests/test_pdfviewer.py
 
 Exits non-zero if any check fails.
 """
@@ -15,7 +15,13 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
+
+# The suite sits in tests/, so the repo root -- which holds pdfviewer.py and the
+# viewer package -- has to go on the path before those imports resolve.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # Isolate the last-read-page persistence into a throwaway dir, so tests don't
@@ -26,7 +32,8 @@ os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="pv_test_state_")
 import fitz
 import numpy as np
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QPoint, QPointF, QSize, QEvent
+from PySide6.QtCore import (Qt, QPoint, QPointF, QSize, QEvent, QEventLoop,
+                            QThreadPool, QTimer)
 from PySide6.QtGui import QShortcut, QImage, QPixmap, QMouseEvent, QClipboard
 from PySide6.QtTest import QTest
 
@@ -44,9 +51,60 @@ def check(label, cond):
         _failures.append(label)
 
 
-def pump(n=40):
+# Every background task in the viewer goes through the global QThreadPool
+# (capped to one thread in viewer/__init__.py); the only other worker is the
+# document "pdf-slurp" thread, which is a plain threading.Thread.
+_POOL = QThreadPool.globalInstance()
+_PUMP_LOOP = QEventLoop()
+
+
+def _timer_pending():
+    """True if any live widget has an armed QTimer.
+
+    Debounces and watchdogs run from 8 ms up to BUSY_INTERVAL_MS (500 ms), far
+    longer than the idle streak below, so an armed timer has to count as work
+    outstanding -- otherwise pump() returns while the result it was waiting for
+    is still one timeout away. A repeating timer that is always armed simply
+    costs pump() its early exit, which is slow but never wrong.
+    """
+    for w in APP.topLevelWidgets():
+        for t in w.findChildren(QTimer):
+            if t.isActive():
+                return True
+    return False
+
+
+def _work_outstanding(handled):
+    """True if anything might still deliver a result to the GUI thread."""
+    return (handled                              # events were just processed
+            or _POOL.activeThreadCount() > 0     # a render/search/detect task
+            or threading.active_count() > 1)     # a document slurp thread
+
+
+def pump(n=40, quiet=10):
+    """Spin the event loop so background work can land.
+
+    Returns as soon as the loop has been idle -- nothing processed, no pool
+    task running, no slurp thread -- for `quiet` consecutive iterations, and
+    otherwise keeps going for the full `n`. The idle streak, rather than a
+    single idle iteration, is what makes the early exit safe: a task that has
+    been queued but not yet picked up shows up as idle for an instant, and a
+    caller waiting on a QTimer that has not fired yet still gets the whole
+    budget. Raising `quiet` above `n` restores the old unconditional spin.
+    """
+    idle = 0
     for _ in range(n):
-        APP.processEvents()
+        if _work_outstanding(_PUMP_LOOP.processEvents(QEventLoop.AllEvents)):
+            idle = 0
+        else:
+            idle += 1
+            if idle >= quiet:
+                # Scanning the widget tree for armed timers is the expensive
+                # check, so it runs only here, once a streak has already gone
+                # by -- not on every idle iteration.
+                if not _timer_pending():
+                    return
+                idle = 0
         time.sleep(0.003)
 
 
@@ -509,7 +567,7 @@ def test_wayland_only_requested_in_a_wayland_session():
     probe = ("import os, sys;"
              "sys.path.insert(0, %r);"
              "import viewer;"
-             "print(os.environ.get('QT_QPA_PLATFORM'))" % os.path.dirname(os.path.abspath(__file__)))
+             "print(os.environ.get('QT_QPA_PLATFORM'))" % REPO_ROOT)
 
     def platform_for(env):
         base = dict(os.environ)
@@ -1473,8 +1531,7 @@ def test_entry_point_and_helper_prompt_paths():
           pdfviewer.PdfGridViewer is window.PdfGridViewer)
     check("pdfviewer_xcb.py's import still resolves",
           "from pdfviewer import main" in open(
-              os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "pdfviewer_xcb.py")).read())
+              os.path.join(REPO_ROOT, "pdfviewer_xcb.py")).read())
     # Ask the launcher what path it actually passes, rather than recomputing
     # it here -- recomputing would agree with a wrong implementation.
     captured = {}
