@@ -7,7 +7,7 @@ Addison mostly doesn't read the code, but he has made lots of important program 
 The program is very focused and lacks many features others might expect a PDF viewer to have.<br>
 
 The program is being shared with some of Addison's colleagues; they might make changes for their own use.<br>
-They might sometimes commit them.
+They might sometimes push them; we'll see.
 
 Press control+h to learn about the program and customize.<br>
 There is AI-generated documentation in /docs
