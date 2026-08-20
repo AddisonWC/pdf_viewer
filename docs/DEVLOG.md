@@ -245,11 +245,11 @@ non-atomic state write in `_save_last_page`.
   measured; the prompt costs one dialog at startup for files that need it and
   one `needs_pass` read for files that don't. All 33 groups pass.
 
-## 2026-08-19 (later)
+## 2026-08-19 (later) — repository put under git
 
-- **The project is now a git repository.** Single initial commit of the working
-  tree, `main`, no remote yet; Addison intends a private GitHub repo. `venv/`,
-  `__pycache__/`, tool caches and `.claude/settings.local.json` are ignored; the
-  small test PDFs and `designer_notes.txt` are tracked, so the notes travel with
-  the repo if it is ever made public or shared. Nothing in the program changed
-  and nothing was measured.
+- **The project is now a git repository**, pushed to Addison's private GitHub
+  repo `AddisonWC/pdf_viewer`; the initial commit is the working tree as it
+  stood. `venv/`, `__pycache__/`, tool caches and `.claude/settings.local.json`
+  are ignored; the small test PDFs and `designer_notes.txt` are tracked, so the
+  notes travel with the repo to anyone it is shared with. Nothing in the program
+  changed and nothing was measured.
