@@ -1,0 +1,8 @@
+# Test-only dependency, deliberately kept out of requirements.txt: the viewer
+# itself needs nothing here, and someone who just wants to read PDFs should not
+# be asked to install a test runner.
+#
+# Known good: pytest 9.1.1 on Python 3.14.7. The floor is where bare `assert`
+# rewriting and function-scoped autouse fixtures have long been stable; the
+# suite uses no plugins (pytest-qt included -- see ARCHITECTURE.md).
+pytest>=7,<10

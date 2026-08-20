@@ -90,7 +90,21 @@ nothing" reports were binding-layer bugs with a perfectly good handler.
   package anyway, and failed from every other cwd. Run from somewhere else
   before trusting a path change here.
 - **The suite sets `XDG_STATE_HOME` to a temp dir.** Last-read-page persistence
-  is real global on-disk state and leaks between runs otherwise.
+  is real global on-disk state and leaks between runs otherwise. Set at module
+  import so it covers anything the import chain or a subprocess test does, and
+  removed again in the `_documents` fixture teardown.
+- **One `QApplication` is shared by all 43 tests, so a leaked window is the
+  next test's problem.** Its timers keep firing and its render tasks keep
+  landing in the global pool, which the next `pump()` then waits on. The autouse
+  `_no_leftover_windows` fixture closes every top-level widget after each test;
+  tests still call `v.close()` themselves, and the fixture is the net under a
+  failing assert, which skips that line. Do not remove it to "clean up
+  duplication".
+- **Test order is now definition order, not a hand-written list.** pytest
+  collects top to bottom, so moving a test function moves when it runs. The
+  suite passed unchanged in the new order, so nothing is known to be
+  order-dependent — but that is an observation, not a guarantee the shared
+  `QApplication` provides.
 - **`page.draw_rect` commits a whole `Shape` per call** — 24 000 calls takes over
   two minutes. Write raw `re f` operators via `doc.update_stream` instead, one
   operator per mark (a single `Shape` merges into one `fill-path`).

@@ -359,3 +359,36 @@ its smaller ones. `docs/REVIEW-2026-08.md` records what was declined and why.
   scanned textbooks. Corrected by Addison: the cold-read figures come from a
   single large scanned textbook, other behaviour has been checked by hand
   against assorted real PDFs, and the automated suite uses neither.
+
+## 2026-08-19 (later still) — the suite runs under pytest
+
+- **43 tests, 22.2 s, green.** Was 20.5 s under the hand-rolled runner; the
+  ~1.7 s is the per-test window sweep and its `pump()`. Verified from the repo
+  root, from inside `tests/`, and from `$HOME`, and via
+  `python tests/test_pdfviewer.py`, which now just calls `pytest.main`.
+- **The check count is gone, and the number in older entries doesn't carry
+  forward.** 211 `check(label, cond)` call sites became `assert cond, label`
+  — 222 at runtime, since some sit in loops. pytest counts the 43 test
+  functions instead, so "222/222" above and "43 passed" here are the same
+  suite measured two ways. Don't read the drop as lost coverage.
+- **The rewrite was done by script, not by hand,** walking the AST for
+  `check(...)` expression statements and splicing over their exact source
+  spans, so multi-line conditions and the `;`-joined calls came through
+  unchanged. Worth repeating for the next mechanical pass of this size.
+- **Two `assert True` placeholders were deleted** in
+  `test_zoom_out_from_content_crop_stays_in_page`. They existed only so both
+  branches contributed the same number of checks to the total — an artifact of
+  counting checks, and dead weight once the count stopped mattering.
+- **Order changed and nothing broke.** The old `main()` list ran the tests in a
+  different order than they are defined; pytest runs them top to bottom. Ten
+  tests moved, including the whole detection block, and the suite passed
+  unchanged. That is evidence of independence, not proof — see `GOTCHAS.md`.
+- **A deliberate failure was injected to confirm the payoff.** One broken
+  assert in `test_paging` reported `assert 9 == 999` with the receiver's repr,
+  stopped that test at the failing line rather than cascading, and left the two
+  tests after it passing; `-k` cut the run to 1.7 s.
+- **`pytest>=7,<10` lives in a new `requirements-dev.txt`,** not in
+  `requirements.txt` — the viewer has no test-time dependency and a reader
+  shouldn't be made to install a runner. No plugins; `pytest-qt` was considered
+  and rejected, since `pump()` already models this program's thread pool and
+  armed timers and `qtbot.wait*` does not.

@@ -7,16 +7,23 @@ resulting state. Not a pixel test -- it can't judge how things look -- but it
 catches crashes and logic regressions in navigation, zoom/crop, the box-zoom
 collapse + restore, search, and TOC behaviour.
 
-    python tests/test_pdfviewer.py  # or: venv/bin/python tests/test_pdfviewer.py
+    venv/bin/python -m pytest tests/            # the whole suite
+    venv/bin/python -m pytest tests/ -k search  # one group
 
-Exits non-zero if any check fails.
+Every test drives the one process-wide QApplication, so they share a Qt event
+loop, the global QThreadPool and the widget tree. The autouse fixture
+`_no_leftover_windows` below is what keeps a failure in one test from leaking
+a live window into the next.
 """
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
 import time
+
+import pytest
 
 # The suite sits in tests/, so the repo root -- which holds pdfviewer.py and the
 # viewer package -- has to go on the path before those imports resolve.
@@ -41,14 +48,6 @@ import pdfviewer
 from viewer import constants, detect, document, integrations, render, tasks, window
 
 APP = QApplication.instance() or QApplication(["test"])
-
-_failures = []
-
-
-def check(label, cond):
-    print(("  ok  " if cond else "FAIL  ") + label)
-    if not cond:
-        _failures.append(label)
 
 
 # Every background task in the viewer goes through the global QThreadPool
@@ -295,7 +294,10 @@ def _make_image_figure_pdf(path, pages=2):
     doc.close()
 
 
-SCRATCH = os.environ.get("TMPDIR", "/tmp")
+# A private directory per run: the documents below are built into it once, and
+# the handful of tests that write their own scratch PDFs put them here too, so
+# two concurrent runs can never read each other's files.
+SCRATCH = tempfile.mkdtemp(prefix="pv_test_pdfs_")
 TOC_PDF = os.path.join(SCRATCH, "test_pv_toc.pdf")
 PLAIN_PDF = os.path.join(SCRATCH, "test_pv_plain.pdf")
 CITATION_PDF = os.path.join(SCRATCH, "test_pv_citation.pdf")
@@ -303,13 +305,44 @@ SCAN_PDF = os.path.join(SCRATCH, "test_pv_scan.pdf")
 FIGURE_PDF = os.path.join(SCRATCH, "test_pv_figure.pdf")
 DENSE_PDF = os.path.join(SCRATCH, "test_pv_dense.pdf")
 IMAGE_FIGURE_PDF = os.path.join(SCRATCH, "test_pv_image_figure.pdf")
-_make_toc_pdf(TOC_PDF)
-_make_plain_pdf(PLAIN_PDF)
-_make_citation_pdf(CITATION_PDF)
-_make_scanned_pdf(SCAN_PDF)
-_make_figure_pdf(FIGURE_PDF)
-_make_dense_figure_pdf(DENSE_PDF)
-_make_image_figure_pdf(IMAGE_FIGURE_PDF)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _documents():
+    """Build every shared test PDF once, before the first test.
+
+    Autouse and session-scoped rather than a per-test fixture because building
+    them costs about a second and no test writes to them -- they are read-only
+    inputs named by the module constants above.
+    """
+    _make_toc_pdf(TOC_PDF)
+    _make_plain_pdf(PLAIN_PDF)
+    _make_citation_pdf(CITATION_PDF)
+    _make_scanned_pdf(SCAN_PDF)
+    _make_figure_pdf(FIGURE_PDF)
+    _make_dense_figure_pdf(DENSE_PDF)
+    _make_image_figure_pdf(IMAGE_FIGURE_PDF)
+    yield
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    shutil.rmtree(os.environ["XDG_STATE_HOME"], ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_windows():
+    """Close anything a test left open, whether it passed or blew up.
+
+    Every test shares one QApplication, so a window that outlives its test
+    keeps receiving events -- its render tasks land in the global pool, its
+    timers keep firing, and the next test's pump() waits on them. Tests still
+    close their own windows; this is the net under a failing assert, which
+    skips the trailing v.close() and would otherwise turn one red test into a
+    cascade.
+    """
+    yield
+    for w in list(APP.topLevelWidgets()):
+        w.close()
+        w.deleteLater()
+    pump()
 
 
 def new_viewer(path, rows=1, cols=1):
@@ -332,7 +365,7 @@ def test_shortcuts_bound():
     keys = {s.key().toString() for s in v.findChildren(QShortcut)}
     for k in ["H", "L", "J", "K", "M", "B", "-", "=", "+", ";", "T", "/", "0", "C",
               "Ctrl+C"]:
-        check(f"shortcut bound: {k!r}", k in keys)
+        assert k in keys, f"shortcut bound: {k!r}"
     v.close()
 
 
@@ -342,20 +375,20 @@ def test_paging():
     v._show_current_pages()
     pump()
     QTest.keyClick(v, Qt.Key_H); pump()
-    check("H pages back one", v.first_page == 9)
+    assert v.first_page == 9, "H pages back one"
     QTest.keyClick(v, Qt.Key_L); pump()
-    check("L pages forward one", v.first_page == 10)
+    assert v.first_page == 10, "L pages forward one"
     QTest.keyClick(v, Qt.Key_J); pump()
-    check("J pages down one row (cols=2 -> +2)", v.first_page == 12)
+    assert v.first_page == 12, "J pages down one row (cols=2 -> +2)"
     QTest.keyClick(v, Qt.Key_K); pump()
-    check("K pages up one row", v.first_page == 10)
+    assert v.first_page == 10, "K pages up one row"
     QTest.keyClick(v, Qt.Key_Home); pump()
-    check("Home -> first page", v.first_page == 0)
+    assert v.first_page == 0, "Home -> first page"
     QTest.keyClick(v, Qt.Key_End); pump()
     # End fills the grid (full-grid clamp), so the last page is visible in the
     # grid rather than necessarily pinned to the first cell.
     last_visible = v.first_page <= v.page_count - 1 <= v.first_page + v.rows * v.cols - 1
-    check("End shows the last page", last_visible)
+    assert last_visible, "End shows the last page"
     v.close()
 
 
@@ -364,16 +397,17 @@ def test_status_format():
     v.first_page = 0
     v._update_status()
     # startswith, not endswith: the busy indicator is appended after the range.
-    check("status overlay format 'first-last/total'", v.status_overlay.text().startswith("1-2/40"))
+    assert v.status_overlay.text().startswith("1-2/40"), \
+        "status overlay format 'first-last/total'"
     v.close()
 
 
 def test_grid_resize():
     v = new_viewer(TOC_PDF, 1, 1)
     QTest.keyClick(v, Qt.Key_Period); pump()   # more cols
-    check("'.' increases cols", v.cols == 2)
+    assert v.cols == 2, "'.' increases cols"
     QTest.keyClick(v, Qt.Key_Comma); pump()    # fewer cols
-    check("',' decreases cols", v.cols == 1)
+    assert v.cols == 1, "',' decreases cols"
     v.close()
 
 
@@ -384,12 +418,12 @@ def test_cursor_zoom():
     v._zoom_focus = (0, 0.5, 0.5)
     v.zoom_in_step(); pump()
     c1 = v.crop_rect
-    check("zoom in sets a crop", c1 is not None)
+    assert c1 is not None, "zoom in sets a crop"
     ratio = full / c1.width if c1 else 0
-    check("one zoom-in step ~= ZOOM_STEP", abs(ratio - constants.ZOOM_STEP) < 0.02)
+    assert abs(ratio - constants.ZOOM_STEP) < 0.02, "one zoom-in step ~= ZOOM_STEP"
     for _ in range(30):
         v.zoom_out_step(); pump(4)
-    check("zooming all the way out clears the crop", v.crop_rect is None)
+    assert v.crop_rect is None, "zooming all the way out clears the crop"
     v.close()
 
 
@@ -402,11 +436,10 @@ def test_zoom_out_from_content_crop_stays_in_page():
     pr = v.doc.load_page(v._current_page_index()).rect
     v.zoom_out_step(); pump()
     if v.crop_rect is not None:
-        check("zoom-out crop within page width", v.crop_rect.width <= pr.width + 0.5)
-        check("zoom-out crop within page height", v.crop_rect.height <= pr.height + 0.5)
-    else:
-        check("zoom-out dropped crop (also fine)", True)
-        check("zoom-out dropped crop (also fine)", True)
+        assert v.crop_rect.width <= pr.width + 0.5, "zoom-out crop within page width"
+        assert v.crop_rect.height <= pr.height + 0.5, "zoom-out crop within page height"
+    # Dropping the crop entirely is the other legal outcome, and has nothing
+    # to assert about.
     v.close()
 
 
@@ -419,18 +452,19 @@ def test_collapse_and_restore():
     cell._drag_current = QPoint(320, 420)
     cell._handle_two_button_gesture(Qt.LeftButton)
     pump()
-    check("collapse -> 1x1 grid", (v.rows, v.cols) == (1, 1))
-    check("collapse sets a crop", v.crop_rect is not None)
-    check("collapse saved the old grid", v._saved_grid == (2, 2, 0))
+    assert (v.rows, v.cols) == (1, 1), "collapse -> 1x1 grid"
+    assert v.crop_rect is not None, "collapse sets a crop"
+    assert v._saved_grid == (2, 2, 0), "collapse saved the old grid"
     # Reset zoom restores the grid, single render, no zoomed-in intermediate.
     events = []
     orig = v._show_current_pages
     v._show_current_pages = lambda *a, **k: (events.append(v.crop_rect is not None), orig(*a, **k))[1]
     v.reset_zoom(); pump()
     v._show_current_pages = orig
-    check("reset restores 2x2 grid", (v.rows, v.cols) == (2, 2))
-    check("reset clears crop + saved grid", v.crop_rect is None and v._saved_grid is None)
-    check("reset renders once, zoomed-out (no crop)", events == [False])
+    assert (v.rows, v.cols) == (2, 2), "reset restores 2x2 grid"
+    assert v.crop_rect is None and v._saved_grid is None, \
+        "reset clears crop + saved grid"
+    assert events == [False], "reset renders once, zoomed-out (no crop)"
     v.close()
 
 
@@ -448,29 +482,32 @@ def test_recrop_after_collapse_single_render():
     v.zoom_to_content_sampled()  # recrop
     pump(120)
     v._show_current_pages = orig
-    check("recrop after collapse restores grid", (v.rows, v.cols) == (2, 2))
-    check("recrop renders exactly once (no full-page flash)", len(renders) == 1)
+    assert (v.rows, v.cols) == (2, 2), "recrop after collapse restores grid"
+    assert len(renders) == 1, "recrop renders exactly once (no full-page flash)"
     v.close()
 
 
 def test_search_incremental_commit_escape():
     v = new_viewer(PLAIN_PDF, 1, 1)
     QTest.keyClick(v, Qt.Key_Slash); pump()
-    check("'/' opens + focuses search", v.search_overlay.isVisible() and v.search_input.hasFocus())
+    assert v.search_overlay.isVisible() and v.search_input.hasFocus(), \
+        "'/' opens + focuses search"
     QTest.keyClicks(v.search_input, "quick")
     for _ in range(120):
         APP.processEvents(); time.sleep(0.003)
         if v._search_matches:
             break
-    check("live search finds matches without Enter", len(v._search_matches) > 0)
+    assert len(v._search_matches) > 0, "live search finds matches without Enter"
     mi = v._current_match_index
     QTest.keyClick(v.search_input, Qt.Key_Return); pump()
-    check("Enter keeps box open", v.search_overlay.isVisible())
-    check("Enter hands focus back (box unfocused)", not v.search_input.hasFocus())
+    assert v.search_overlay.isVisible(), "Enter keeps box open"
+    assert not v.search_input.hasFocus(), "Enter hands focus back (box unfocused)"
     QTest.keyClick(v, Qt.Key_N); pump()
-    check("'n' advances match (not typed into box)", v._current_match_index != mi and v.search_input.text() == "quick")
+    assert v._current_match_index != mi and v.search_input.text() == "quick", \
+        "'n' advances match (not typed into box)"
     QTest.keyClick(v, Qt.Key_Escape); pump()
-    check("Escape closes + forgets search", not v.search_overlay.isVisible() and v._last_search_query == "" and not v._search_matches)
+    assert (not v.search_overlay.isVisible() and v._last_search_query == ""
+            and not v._search_matches), "Escape closes + forgets search"
     v.close()
 
 
@@ -480,8 +517,8 @@ def test_search_no_match_red():
     QTest.keyClicks(v.search_input, "zzqqxx")
     for _ in range(120):
         APP.processEvents(); time.sleep(0.003)
-    check("no-match query -> red field", "e24d4d" in v.search_input.styleSheet())
-    check("no-match keeps box open", v.search_overlay.isVisible())
+    assert "e24d4d" in v.search_input.styleSheet(), "no-match query -> red field"
+    assert v.search_overlay.isVisible(), "no-match keeps box open"
     v._exit_search(); pump()
     v.close()
 
@@ -498,7 +535,7 @@ def test_search_escape_cancels_inflight_result():
         APP.processEvents(); time.sleep(0.003)
         if v._search_matches:
             break
-    check("search ran before escape", len(v._search_matches) > 0)
+    assert len(v._search_matches) > 0, "search ran before escape"
     # The generation a search dispatched *now* would carry, captured before
     # Escape so the late result below looks exactly like one still in flight.
     inflight_gen = v._search_generation
@@ -506,9 +543,9 @@ def test_search_escape_cancels_inflight_result():
     QTest.keyClick(v, Qt.Key_Escape); pump()
     late = tasks._SearchResult(inflight_gen, [(6, fitz.Rect(72, 72, 200, 90))])
     v._on_search_done(late); pump()
-    check("late result after Escape is discarded", not v._search_matches)
-    check("late result after Escape does not navigate", v.first_page == start_page)
-    check("Escape cleared the in-flight flag", not v._search_inflight)
+    assert not v._search_matches, "late result after Escape is discarded"
+    assert v.first_page == start_page, "late result after Escape does not navigate"
+    assert not v._search_inflight, "Escape cleared the in-flight flag"
     v.close()
 
 
@@ -522,14 +559,15 @@ def test_copy_window_inherits_crop():
     v._crop_generation += 1
     v._show_current_pages(); pump()
     copy = v.open_copy(); pump()
-    check("copy inherits the parent's crop", copy.crop_rect == v.crop_rect)
-    check("copy inherits the crop's source rect", copy.crop_source_rect == v.crop_source_rect)
-    check("copy keeps the parent's grid", (copy.rows, copy.cols) == (v.rows, v.cols))
+    assert copy.crop_rect == v.crop_rect, "copy inherits the parent's crop"
+    assert copy.crop_source_rect == v.crop_source_rect, \
+        "copy inherits the crop's source rect"
+    assert (copy.rows, copy.cols) == (v.rows, v.cols), "copy keeps the parent's grid"
     # A copy of an uncropped window stays uncropped rather than detecting one.
     v2 = new_viewer(PLAIN_PDF, 1, 1)
     v2.reset_zoom(); pump()
     copy2 = v2.open_copy(); pump(80)
-    check("copy of an uncropped window stays uncropped", copy2.crop_rect is None)
+    assert copy2.crop_rect is None, "copy of an uncropped window stays uncropped"
     for w in (copy, v, copy2, v2):
         w.close()
 
@@ -547,13 +585,15 @@ def test_copy_window_outlives_its_parent():
     v = new_viewer(PLAIN_PDF, 1, 2)
     copy = v.open_copy(); pump()
     handle = copy.windowHandle()
-    check("copy released the transient-parent link", handle is None or handle.transientParent() is None)
+    assert handle is None or handle.transientParent() is None, \
+        "copy released the transient-parent link"
     linked = v._open_linked_copy(v.cells[0], 3); pump()
     lhandle = linked.windowHandle()
-    check("linked copy released it too", lhandle is None or lhandle.transientParent() is None)
+    assert lhandle is None or lhandle.transientParent() is None, \
+        "linked copy released it too"
     v.close(); pump()
-    check("copy survives its parent closing", copy.isVisible())
-    check("linked copy survives its parent closing", linked.isVisible())
+    assert copy.isVisible(), "copy survives its parent closing"
+    assert linked.isVisible(), "linked copy survives its parent closing"
     copy.close(); linked.close()
 
 
@@ -578,17 +618,17 @@ def test_wayland_only_requested_in_a_wayland_session():
                              text=True, env=base)
         return out.stdout.strip().splitlines()[-1] if out.stdout.strip() else out.stderr
 
-    check("wayland session -> wayland",
-          platform_for({"WAYLAND_DISPLAY": "wayland-0"}) == "wayland")
-    check("XDG_SESSION_TYPE=wayland alone -> wayland",
-          platform_for({"XDG_SESSION_TYPE": "wayland"}) == "wayland")
-    check("x11 session -> Qt chooses (unset)",
-          platform_for({"XDG_SESSION_TYPE": "x11"}) == "None")
-    check("no session hints at all -> Qt chooses (unset)",
-          platform_for({"XDG_SESSION_TYPE": ""}) == "None")
-    check("an explicit platform still wins",
-          platform_for({"WAYLAND_DISPLAY": "wayland-0",
-                        "QT_QPA_PLATFORM": "offscreen"}) == "offscreen")
+    assert platform_for({"WAYLAND_DISPLAY": "wayland-0"}) == "wayland", \
+        "wayland session -> wayland"
+    assert platform_for({"XDG_SESSION_TYPE": "wayland"}) == "wayland", \
+        "XDG_SESSION_TYPE=wayland alone -> wayland"
+    assert platform_for({"XDG_SESSION_TYPE": "x11"}) == "None", \
+        "x11 session -> Qt chooses (unset)"
+    assert platform_for({"XDG_SESSION_TYPE": ""}) == "None", \
+        "no session hints at all -> Qt chooses (unset)"
+    assert platform_for({"WAYLAND_DISPLAY": "wayland-0",
+                         "QT_QPA_PLATFORM": "offscreen"}) == "offscreen", \
+        "an explicit platform still wins"
 
 
 def test_toc_fluid_nav_and_out():
@@ -596,19 +636,23 @@ def test_toc_fluid_nav_and_out():
     v.toc_nav_next(); pump()          # init select "1 Section"
     v.toc_nav_descend(); pump()       # O -> 1.1 Sub, level 2
     v.toc_nav_descend(); pump()       # O -> 1.1.1 Subsub, level 3
-    check("O dives to bottom level", toc_current(v) == "1.1.1 Subsub" and v._actual_toc_level == 3)
+    assert toc_current(v) == "1.1.1 Subsub" and v._actual_toc_level == 3, \
+        "O dives to bottom level"
     v.toc_nav_previous(); pump()      # I up -> 1.1 Sub (still expanded)
-    check("I pages up onto expanded parent", toc_current(v) == "1.1 Sub")
+    assert toc_current(v) == "1.1 Sub", "I pages up onto expanded parent"
     v.toc_nav_ascend(); pump()        # Y: close subs, stay, level 2
-    check("first Y closes subsections in place", toc_current(v) == "1.1 Sub" and v._actual_toc_level == 2)
+    assert toc_current(v) == "1.1 Sub" and v._actual_toc_level == 2, \
+        "first Y closes subsections in place"
     v.toc_nav_ascend(); pump()        # Y: climb to parent
-    check("second Y climbs to parent", toc_current(v) == "1 Section" and v._actual_toc_level == 1)
+    assert toc_current(v) == "1 Section" and v._actual_toc_level == 1, \
+        "second Y climbs to parent"
     # O at bottom just (re)commits the level
     v.toc_nav_descend(); pump()       # -> 1.1 Sub lvl2
     v.toc_nav_descend(); pump()       # -> 1.1.1 Subsub lvl3
     v._actual_toc_level = 1
     v.toc_nav_descend(); pump()       # O at bottom
-    check("O at bottom recommits level", v._actual_toc_level == 3 and toc_current(v) == "1.1.1 Subsub")
+    assert v._actual_toc_level == 3 and toc_current(v) == "1.1.1 Subsub", \
+        "O at bottom recommits level"
     v.close()
 
 
@@ -616,37 +660,39 @@ def test_toc_header_highlight_and_close():
     v = new_viewer(TOC_PDF, 1, 1)
     v.toc_nav_next(); pump()          # -> "1 Section" on page 1
     hl = v._toc_text_highlight
-    check("TOC nav sets an in-document header highlight", hl is not None and len(hl[1]) > 0)
-    check("highlight is on the destination page", hl is not None and hl[0] == v._current_page_index())
-    check("get_toc_text_highlights returns rects for that page",
-          len(v.get_toc_text_highlights(hl[0])) > 0 if hl else False)
+    assert hl is not None and len(hl[1]) > 0, \
+        "TOC nav sets an in-document header highlight"
+    assert hl is not None and hl[0] == v._current_page_index(), \
+        "highlight is on the destination page"
+    assert len(v.get_toc_text_highlights(hl[0])) > 0 if hl else False, \
+        "get_toc_text_highlights returns rects for that page"
     # Closing the TOC clears the in-document highlight.
     v.toggle_toc(); pump()
-    check("closing TOC hides the panel", not v.toc_dock.isVisible())
-    check("closing TOC clears the header highlight", v._toc_text_highlight is None)
+    assert not v.toc_dock.isVisible(), "closing TOC hides the panel"
+    assert v._toc_text_highlight is None, "closing TOC clears the header highlight"
     v.close()
 
 
 def test_toc_semicolon_toggle_and_no_toc_doc():
     v = new_viewer(PLAIN_PDF, 1, 1)
-    check("plain doc has no TOC entries", not v._toc_has_entries)
+    assert not v._toc_has_entries, "plain doc has no TOC entries"
     QTest.keyClick(v, Qt.Key_Semicolon); pump()
-    check("';' opens the (empty) TOC panel", v.toc_dock.isVisible())
+    assert v.toc_dock.isVisible(), "';' opens the (empty) TOC panel"
     QTest.keyClick(v, Qt.Key_Semicolon); pump()
-    check("';' closes it again", not v.toc_dock.isVisible())
+    assert not v.toc_dock.isVisible(), "';' closes it again"
     v.toc_nav_next(); pump()  # must not crash on a TOC-less doc
-    check("TOC nav on no-TOC doc is a safe no-op", toc_current(v) is None)
+    assert toc_current(v) is None, "TOC nav on no-TOC doc is a safe no-op"
     v.close()
 
 
 def test_misc_no_crash():
     v = new_viewer(TOC_PDF, 1, 2)
     QTest.keyClick(v, Qt.Key_D); pump()          # dark mode
-    check("dark mode toggles", v.dark_mode)
-    v.show_help(); pump(); check("help shows", v._help_visible)
-    v.hide_help(); pump(); check("help hides", not v._help_visible)
+    assert v.dark_mode, "dark mode toggles"
+    v.show_help(); pump(); assert v._help_visible, "help shows"
+    v.hide_help(); pump(); assert not v._help_visible, "help hides"
     cp = v.open_copy(); pump()
-    check("open_copy makes an independent window", cp is not None and cp is not v)
+    assert cp is not None and cp is not v, "open_copy makes an independent window"
     cp.close(); v.close()
 
 
@@ -678,38 +724,39 @@ def test_dark_mode_pixel_math():
         c = img.pixelColor(x, 0)
         return (c.red(), c.green(), c.blue())
 
-    check("dark: black -> white", px(0) == (255, 255, 255))
-    check("dark: white -> black", px(1) == (0, 0, 0))
-    check("dark: pure red preserved (hue kept)", px(2) == (255, 0, 0))
-    check("dark: dark blue -> light blue (hue kept)", px(3) == (116, 116, 255))
+    assert px(0) == (255, 255, 255), "dark: black -> white"
+    assert px(1) == (0, 0, 0), "dark: white -> black"
+    assert px(2) == (255, 0, 0), "dark: pure red preserved (hue kept)"
+    assert px(3) == (116, 116, 255), "dark: dark blue -> light blue (hue kept)"
     light = render._pix_to_qimage(_FakePix(arr), dark=False)
     lc = light.pixelColor(2, 0)
-    check("light: passthrough unchanged", (lc.red(), lc.green(), lc.blue()) == (255, 0, 0))
+    assert (lc.red(), lc.green(), lc.blue()) == (255, 0, 0), \
+        "light: passthrough unchanged"
 
 
 def test_pixmap_cache_invariants():
     v = new_viewer(PLAIN_PDF, 1, 1)
     key = v._cache_key(0, 100, 100)
-    check("cache key is a 6-tuple", len(key) == 6)
-    check("cache key carries DPR", key[5] == render._dpr_key(v._dpr()))
+    assert len(key) == 6, "cache key is a 6-tuple"
+    assert key[5] == render._dpr_key(v._dpr()), "cache key carries DPR"
     # Byte-budget eviction: many pixmaps far exceeding the budget must evict
     # oldest-first while keeping the cache under budget.
     v._pixmap_cache.clear()
     big = QPixmap(3000, 3000)  # ~36 MB at 32bpp
     for i in range(10):        # ~360 MB total, well over the 256 MB budget
         v._pixmap_cache.put(("fake", i), big)
-    check("byte budget keeps cache under budget",
-          v._pixmap_cache.total_bytes <= render._PIXMAP_CACHE_BUDGET_BYTES)
-    check("newest survives, oldest evicted",
-          ("fake", 9) in v._pixmap_cache and ("fake", 0) not in v._pixmap_cache)
+    assert v._pixmap_cache.total_bytes <= render._PIXMAP_CACHE_BUDGET_BYTES, \
+        "byte budget keeps cache under budget"
+    assert ("fake", 9) in v._pixmap_cache and ("fake", 0) not in v._pixmap_cache, \
+        "newest survives, oldest evicted"
     huge = QPixmap(9000, 9000)  # ~324 MB alone -- larger than the whole budget
     v._pixmap_cache.put(("huge", 0), huge)
-    check("single over-budget pixmap still cached", ("huge", 0) in v._pixmap_cache)
+    assert ("huge", 0) in v._pixmap_cache, "single over-budget pixmap still cached"
     v._pixmap_cache.clear()
     # render_page reads the cache now (it used to only ever write it).
     pm1 = v.render_page(0, QSize(400, 500))
     pm2 = v.render_page(0, QSize(400, 500))
-    check("render_page returns cached pixmap on repeat", pm1 is pm2)
+    assert pm1 is pm2, "render_page returns cached pixmap on repeat"
     v.close()
 
 
@@ -720,7 +767,7 @@ def test_stale_render_does_not_clobber():
     pump(60)  # let the real background render land
     cell = v.cells[0]
     crisp = cell._page_pixmap
-    check("cell has a crisp render to protect", crisp is not None)
+    assert crisp is not None, "cell has a crisp render to protect"
     stale = QImage(50, 60, QImage.Format_RGB888)
     stale.fill(Qt.red)
     result = tasks._RenderResult(
@@ -728,8 +775,8 @@ def test_stale_render_does_not_clobber():
         50, 60, v._crop_generation, v.dark_mode, v._dpr(), stale, None)
     v._render_inflight = 1
     v._on_render_done(result)
-    check("stale-size render result does not replace current pixmap",
-          cell._page_pixmap is crisp)
+    assert cell._page_pixmap is crisp, \
+        "stale-size render result does not replace current pixmap"
     v.close()
 
 
@@ -741,18 +788,17 @@ def test_history_back_and_clamp():
     pump()
     n = len(v._history)
     v.jump_to_page(5, animate=False)  # same page again
-    check("re-jump to current page adds no duplicate history entry",
-          len(v._history) == n)
+    assert len(v._history) == n, \
+        "re-jump to current page adds no duplicate history entry"
     back_target = v._history[v._history_pos - 1]
     v.history_back()
     pump()
-    check("history_back returns to the previous position",
-          v.first_page == back_target)
+    assert v.first_page == back_target, "history_back returns to the previous position"
     # Overscroll clamp: a negative first_page must not index a bad page for
     # the content-detect reference.
     v.first_page = -2
-    check("_current_page_index clamps negative first_page",
-          v._current_page_index() == 0)
+    assert v._current_page_index() == 0, \
+        "_current_page_index clamps negative first_page"
     v.first_page = 0
     v.close()
 
@@ -785,21 +831,23 @@ def test_center_drag_pan_and_click():
     # No crop: pan is a no-op.
     v.reset_zoom(); pump()
     v.pan_crop(cell, 40, 0)
-    check("pan with no crop is a no-op", v.crop_rect is None)
+    assert v.crop_rect is None, "pan with no crop is a no-op"
     # Zoom in, then pan: window slides opposite the drag, size preserved, clamped.
     v._zoom_focus = (0, 0.5, 0.5)
     v.zoom_in_step(); v.zoom_in_step(); pump()
     c0 = fitz.Rect(v.crop_rect)
     v.pan_crop(cell, 60, 40); pump()
     c1 = v.crop_rect
-    check("center-drag-right pans window left", c1.x0 < c0.x0)
-    check("center-drag-down pans window up", c1.y0 < c0.y0)
-    check("pan preserves crop size", abs(c1.width - c0.width) < 1e-6 and abs(c1.height - c0.height) < 1e-6)
+    assert c1.x0 < c0.x0, "center-drag-right pans window left"
+    assert c1.y0 < c0.y0, "center-drag-down pans window up"
+    assert abs(c1.width - c0.width) < 1e-6 and abs(c1.height - c0.height) < 1e-6, \
+        "pan preserves crop size"
     for _ in range(200):
         v.pan_crop(cell, 500, 500)
     src, cr = v.crop_source_rect, v.crop_rect
-    check("pan clamps inside the page", cr.x0 >= src.x0 - 1e-6 and cr.y0 >= src.y0 - 1e-6
-          and cr.x1 <= src.x1 + 1e-6 and cr.y1 <= src.y1 + 1e-6)
+    assert (cr.x0 >= src.x0 - 1e-6 and cr.y0 >= src.y0 - 1e-6
+            and cr.x1 <= src.x1 + 1e-6
+            and cr.y1 <= src.y1 + 1e-6), "pan clamps inside the page"
     # Event flow: a real center-drag pans (and does not follow the link).
     # Re-center the zoom first so a drag-right isn't already against the edge.
     v.reset_zoom(); pump()
@@ -811,20 +859,20 @@ def test_center_drag_pan_and_click():
         APP.sendEvent(cell, _mouse("move", (400 + i * 15, 450), Qt.NoButton, Qt.MiddleButton))
     APP.sendEvent(cell, _mouse("release", (475, 450), Qt.MiddleButton, Qt.NoButton))
     pump()
-    check("center-drag event flow panned the crop", v.crop_rect.x0 != before.x0)
-    check("center-drag left drag state clean", cell._drag_button is None)
+    assert v.crop_rect.x0 != before.x0, "center-drag event flow panned the crop"
+    assert cell._drag_button is None, "center-drag left drag state clean"
     # A plain center-click (no drag) still follows the link in a new copy.
     v.reset_zoom(); pump()
     calls = []
     orig = v.follow_link
     v.follow_link = lambda link, pi, in_new_copy=False: calls.append(in_new_copy)
     hit = _widget_point_over(cell, 180, 92, 210, 108)
-    check("found a widget point over the citation link", hit is not None)
+    assert hit is not None, "found a widget point over the citation link"
     if hit:
         APP.sendEvent(cell, _mouse("press", hit, Qt.MiddleButton, Qt.MiddleButton))
         APP.sendEvent(cell, _mouse("release", hit, Qt.MiddleButton, Qt.NoButton))
         pump()
-        check("plain center-click follows link in a new copy", calls == [True])
+        assert calls == [True], "plain center-click follows link in a new copy"
     v.follow_link = orig
     v.close()
 
@@ -836,16 +884,21 @@ def test_citation_to_web_search():
     window.QDesktopServices.openUrl = lambda url: captured.append(url.toString())
     try:
         link = v.link_at(0, (195, 100))  # over the citation link rect on page 0
-        check("link_at finds the citation link", link is not None)
+        assert link is not None, "link_at finds the citation link"
         v.follow_link_to_web_search(link, 0)
         url = captured[0] if captured else None
-        check("opens a Google Scholar URL", url is not None and "scholar.google.com" in url)
+        assert url is not None and "scholar.google.com" in url, \
+            "opens a Google Scholar URL"
         # The link targets the middle entry [2] (Hopper); the search text must be
         # that whole entry and NOT bleed into [1] (Lovelace) or [3] (Turing).
-        check("Scholar query carries the cited entry [2]", url is not None and "Hopper" in url)
-        check("Scholar query includes the entry's continuation line", url is not None and "1952" in url)
-        check("Scholar query does not bleed into the previous entry", url is not None and "Lovelace" not in url)
-        check("Scholar query does not bleed into the next entry", url is not None and "Turing" not in url)
+        assert url is not None and "Hopper" in url, \
+            "Scholar query carries the cited entry [2]"
+        assert url is not None and "1952" in url, \
+            "Scholar query includes the entry's continuation line"
+        assert url is not None and "Lovelace" not in url, \
+            "Scholar query does not bleed into the previous entry"
+        assert url is not None and "Turing" not in url, \
+            "Scholar query does not bleed into the next entry"
     finally:
         window.QDesktopServices.openUrl = orig
     # The citation number wins over a misleading destination point: a point
@@ -855,10 +908,12 @@ def test_citation_to_web_search():
     # resolves to [1].)
     aim_at_1 = fitz.Point(50, 106)
     by_number = v._reference_text_at(1, aim_at_1, number=2)
-    check("number match overrides a wrong destination point", by_number and "Hopper" in by_number
-          and "Lovelace" not in by_number)
+    assert (by_number and "Hopper" in by_number
+            and "Lovelace" not in by_number), \
+        "number match overrides a wrong destination point"
     by_point = v._reference_text_at(1, aim_at_1, number=None)
-    check("point fallback still works when there's no number", by_point and "Lovelace" in by_point)
+    assert by_point and "Lovelace" in by_point, \
+        "point fallback still works when there's no number"
     v.close()
 
 
@@ -875,13 +930,13 @@ def test_search_jump_recorded_in_history():
         APP.processEvents(); time.sleep(0.003)
         if v._search_matches:
             break
-    check("search moved to a different page", v.first_page != origin)
+    assert v.first_page != origin, "search moved to a different page"
     moved_to = v.first_page
     QTest.keyClick(v, Qt.Key_Return); pump()  # commit; box stays, focus to doc
     v.history_back(); pump()
-    check("Back after search returns to the pre-search page", v.first_page == origin)
+    assert v.first_page == origin, "Back after search returns to the pre-search page"
     v.history_forward(); pump()
-    check("Forward returns to the search landing page", v.first_page == moved_to)
+    assert v.first_page == moved_to, "Forward returns to the search landing page"
     v.close()
 
 
@@ -902,36 +957,39 @@ def test_ask_claude_launcher():
     integrations.subprocess.Popen = fake_popen
     try:
         QTest.keyClick(v, Qt.Key_Question); pump()
-        check("? shows the Ask Claude box", v.ask_overlay.isVisible())
+        assert v.ask_overlay.isVisible(), "? shows the Ask Claude box"
         QTest.keyClicks(v.ask_input, "where is the trace operator defined")
         QTest.keyClick(v.ask_input, Qt.Key_Return); pump()
-        check("Enter hid the Ask box", not v.ask_overlay.isVisible())
+        assert not v.ask_overlay.isVisible(), "Enter hid the Ask box"
         argv = captured.get("argv")
-        check("launched a terminal subprocess", argv is not None)
-        check("launches gnome-terminal", bool(argv) and argv[0].endswith("gnome-terminal"))
+        assert argv is not None, "launched a terminal subprocess"
+        assert bool(argv) and argv[0].endswith("gnome-terminal"), \
+            "launches gnome-terminal"
         inner = argv[-1] if argv else ""  # the bash -lc command string
-        check("uses the sonnet model", "--model sonnet" in inner)
-        check("sets high effort", "--effort high" in inner)
-        check("appends the helper system prompt file",
-              "--append-system-prompt-file" in inner and "pdf_helper_prompt.txt" in inner)
-        check("seeds the typed context", "trace operator" in inner)
-        check("hands off the pdf path", os.path.abspath(PLAIN_PDF) in inner)
+        assert "--model sonnet" in inner, "uses the sonnet model"
+        assert "--effort high" in inner, "sets high effort"
+        assert ("--append-system-prompt-file" in inner
+                and "pdf_helper_prompt.txt" in inner), \
+            "appends the helper system prompt file"
+        assert "trace operator" in inner, "seeds the typed context"
+        assert os.path.abspath(PLAIN_PDF) in inner, "hands off the pdf path"
 
         # Empty box still launches, with a stand-by prompt.
         captured.clear()
         QTest.keyClick(v, Qt.Key_Question); pump()
         QTest.keyClick(v.ask_input, Qt.Key_Return); pump()
-        check("empty box still launches", "argv" in captured)
+        assert "argv" in captured, "empty box still launches"
         inner2 = captured.get("argv", [""])[-1]
-        check("empty box tells claude to stand by", "Wait for my instructions" in inner2)
+        assert "Wait for my instructions" in inner2, \
+            "empty box tells claude to stand by"
 
         # Escape cancels without launching.
         captured.clear()
         QTest.keyClick(v, Qt.Key_Question); pump()
-        check("? reopened the box", v.ask_overlay.isVisible())
+        assert v.ask_overlay.isVisible(), "? reopened the box"
         QTest.keyClick(v, Qt.Key_Escape); pump()
-        check("Escape hid the Ask box", not v.ask_overlay.isVisible())
-        check("Escape did not launch", "argv" not in captured)
+        assert not v.ask_overlay.isVisible(), "Escape hid the Ask box"
+        assert "argv" not in captured, "Escape did not launch"
     finally:
         integrations.shutil.which = orig_which
         integrations.subprocess.Popen = orig_popen
@@ -957,21 +1015,21 @@ def test_document_survives_file_moved():
         pump(5)
         if v._source.ready:
             break
-    check("opened normally before the move", v.page_count == 12)
-    check("document became RAM-resident", v._source.ready)
-    check("main-thread doc moved onto the buffer", not v._buffer_watch.isActive())
+    assert v.page_count == 12, "opened normally before the move"
+    assert v._source.ready, "document became RAM-resident"
+    assert not v._buffer_watch.isActive(), "main-thread doc moved onto the buffer"
 
     os.rename(src, moved)   # the reported failure: move the pdf after opening it
     os.remove(moved)        # and the harsher case -- gone from disk entirely
-    check("file really is gone from disk",
-          not os.path.exists(src) and not os.path.exists(moved))
+    assert not os.path.exists(src) and not os.path.exists(moved), \
+        "file really is gone from disk"
 
     errors = []
     v._render_signals.done.connect(lambda r: r.error and errors.append(r.error))
     v.jump_to_page(10, animate=False)
     pump(80)
-    check("pages still render after the move", not errors)
-    check("moved-to page still produced a pixmap", v.cells[0]._page_pixmap is not None)
+    assert not errors, "pages still render after the move"
+    assert v.cells[0]._page_pixmap is not None, "moved-to page still produced a pixmap"
 
     # Search runs on the worker threads through the same documents.
     QTest.keyClick(v, Qt.Key_Slash); pump()
@@ -980,20 +1038,21 @@ def test_document_survives_file_moved():
         APP.processEvents(); time.sleep(0.003)
         if v._search_matches:
             break
-    check("search still works after the move", len(v._search_matches) > 0)
+    assert len(v._search_matches) > 0, "search still works after the move"
     QTest.keyClick(v, Qt.Key_Escape); pump()
 
     # A copy inherits the buffer instead of re-reading the (now absent) path.
     cp = v.open_copy(); pump(40)
-    check("Ctrl+N copy opens with the file gone", cp is not None and cp.page_count == 12)
-    check("copy shares the parent's buffer", cp._source is v._source)
+    assert cp is not None and cp.page_count == 12, \
+        "Ctrl+N copy opens with the file gone"
+    assert cp._source is v._source, "copy shares the parent's buffer"
     cp.close()
 
     # Rewriting the path with a *different* document must not leak in: the
     # open reader stays on the bytes it was opened with.
     _make_plain_pdf(src, pages=3)
     cp2 = v.open_copy(); pump(40)
-    check("rewritten file does not change the open document", cp2.page_count == 12)
+    assert cp2.page_count == 12, "rewritten file does not change the open document"
     cp2.close()
     v.close()
     os.remove(src)
@@ -1020,17 +1079,17 @@ def test_encrypted_pdf_unlocks_everywhere():
         return "wrong" if len(asked) == 1 else "hunter2"   # first try is wrong
 
     source = document._DocumentSource(path, ask_password=ask)
-    check("prompted, then re-prompted after a wrong password", asked == [False, True])
+    assert asked == [False, True], "prompted, then re-prompted after a wrong password"
     v = window.PdfGridViewer(path, rows=1, cols=2, source=source)
     v.resize(1000, 800); v.show(); pump()
-    check("encrypted document opens once unlocked", v.page_count == 12)
+    assert v.page_count == 12, "encrypted document opens once unlocked"
 
     errors = []
     v._render_signals.done.connect(lambda r: r.error and errors.append(r.error))
     v.jump_to_page(4, animate=False)
     pump(80)
-    check("pages render on a worker thread's own Document", not errors)
-    check("page 5 produced a pixmap", v.cells[0]._page_pixmap is not None)
+    assert not errors, "pages render on a worker thread's own Document"
+    assert v.cells[0]._page_pixmap is not None, "page 5 produced a pixmap"
 
     QTest.keyClick(v, Qt.Key_Slash); pump()
     QTest.keyClicks(v.search_input, "quick")
@@ -1038,23 +1097,23 @@ def test_encrypted_pdf_unlocks_everywhere():
         APP.processEvents(); time.sleep(0.003)
         if v._search_matches:
             break
-    check("search reads the decrypted text", len(v._search_matches) > 0)
+    assert len(v._search_matches) > 0, "search reads the decrypted text"
     QTest.keyClick(v, Qt.Key_Escape); pump()
 
     for _ in range(200):          # let the background read hand over the buffer
         pump(5)
         if source.ready:
             break
-    check("encrypted document became RAM-resident", source.ready)
+    assert source.ready, "encrypted document became RAM-resident"
     v._adopt_buffer()
     errors.clear()
     v.jump_to_page(9, animate=False)
     pump(80)
-    check("stream-opened Documents are unlocked too", not errors)
+    assert not errors, "stream-opened Documents are unlocked too"
 
     cp = v.open_copy(); pump(40)
-    check("Ctrl+N copy stays unlocked without re-prompting",
-          cp is not None and cp.page_count == 12 and asked == [False, True])
+    assert cp is not None and cp.page_count == 12 and asked == [False, True], \
+        "Ctrl+N copy stays unlocked without re-prompting"
     cp.close()
     v.close()
 
@@ -1064,8 +1123,8 @@ def test_encrypted_pdf_unlocks_everywhere():
         refused = None
     except document.EncryptedPdfError as exc:
         refused = str(exc)
-    check("cancelling the prompt raises a clear error",
-          refused is not None and "password" in refused.lower())
+    assert refused is not None and "password" in refused.lower(), \
+        "cancelling the prompt raises a clear error"
     os.remove(path)
 
 
@@ -1102,7 +1161,8 @@ def test_buffer_survives_move_during_load():
         source = document._DocumentSource(src)
     finally:
         document.threading.Thread = orig_thread
-    check("usable before the buffer lands", not source.ready and source.open().page_count == 8)
+    assert not source.ready and source.open().page_count == 8, \
+        "usable before the buffer lands"
 
     os.rename(src, gone)   # file moves mid-load...
     os.remove(gone)        # ...and then vanishes outright
@@ -1111,18 +1171,18 @@ def test_buffer_survives_move_during_load():
     # the held handle via /proc/self/fd (which still resolves to the unlinked
     # inode), and failing that to waiting for the buffer -- the read is
     # finished off on another thread here so that wait can't deadlock.
-    check("/proc/self/fd reaches the unlinked file",
-          source._open_via_handle().page_count == 8)
+    assert source._open_via_handle().page_count == 8, \
+        "/proc/self/fd reaches the unlinked file"
     finisher = orig_thread(target=pending[0], daemon=True)
     finisher.start()
     doc = source.open()
-    check("open() during the load still returns the right document",
-          doc.page_count == 8)
+    assert doc.page_count == 8, \
+        "open() during the load still returns the right document"
     finisher.join(timeout=10)
-    check("handle closed once buffered, so open() now uses the buffer",
-          source._open_via_handle() is None and source.open().page_count == 8)
-    check("read completed off the held handle despite the move", source.ready)
-    check("worker documents come off the buffer too", source.get().page_count == 8)
+    assert source._open_via_handle() is None and source.open().page_count == 8, \
+        "handle closed once buffered, so open() now uses the buffer"
+    assert source.ready, "read completed off the held handle despite the move"
+    assert source.get().page_count == 8, "worker documents come off the buffer too"
 
 
 def test_scanned_page_content_crop():
@@ -1130,26 +1190,26 @@ def test_scanned_page_content_crop():
     # every page and C/M did nothing at all -- including not zooming out.
     doc = fitz.open(SCAN_PDF)
     page = doc.load_page(0)
-    check("scan really has no text layer", len(page.get_text("blocks")) == 0)
+    assert len(page.get_text("blocks")) == 0, "scan really has no text layer"
     r = detect.detect_content_rect(page)
-    check("scan gets a content rect anyway", r is not None)
+    assert r is not None, "scan gets a content rect anyway"
     if r is not None:
         pr = page.rect
         f = (r.x0 / pr.width, r.y0 / pr.height, r.x1 / pr.width, r.y1 / pr.height)
         # Within the 1% pad of the body, having ignored the bed band and dirt.
-        check("scan crop left edge on the body", abs(f[0] - SCAN_BODY[0]) < 0.03)
-        check("scan crop top edge on the body", abs(f[1] - SCAN_BODY[1]) < 0.03)
-        check("scan crop right edge ignores edge dirt", abs(f[2] - SCAN_BODY[2]) < 0.03)
-        check("scan crop bottom edge on the body", abs(f[3] - SCAN_BODY[3]) < 0.03)
-        check("scan crop is a real crop, not the whole page",
-              r.width < pr.width * 0.85 and r.height < pr.height * 0.9)
+        assert abs(f[0] - SCAN_BODY[0]) < 0.03, "scan crop left edge on the body"
+        assert abs(f[1] - SCAN_BODY[1]) < 0.03, "scan crop top edge on the body"
+        assert abs(f[2] - SCAN_BODY[2]) < 0.03, "scan crop right edge ignores edge dirt"
+        assert abs(f[3] - SCAN_BODY[3]) < 0.03, "scan crop bottom edge on the body"
+        assert r.width < pr.width * 0.85 and r.height < pr.height * 0.9, \
+            "scan crop is a real crop, not the whole page"
     doc.close()
     # ...and end to end: C on a scan actually moves the view.
     v = new_viewer(SCAN_PDF, 1, 1)
     pump(120)
     v.reset_zoom(); pump()
     v.zoom_to_content_sampled(); pump(200)
-    check("C crops a scanned document", v.crop_rect is not None)
+    assert v.crop_rect is not None, "C crops a scanned document"
     v.close()
 
 
@@ -1159,11 +1219,11 @@ def test_content_crop_keeps_figures():
     doc = fitz.open(FIGURE_PDF)
     page = doc.load_page(0)
     r = detect.detect_content_rect(page)
-    check("figure page gets a content rect", r is not None)
+    assert r is not None, "figure page gets a content rect"
     if r is not None:
-        check("crop starts above the figure, not at the caption", r.y0 < 100)
-        check("crop still reaches the body text", r.y1 > 640)
-        check("crop stays inside the page", r in page.rect + (-1, -1, 1, 1))
+        assert r.y0 < 100, "crop starts above the figure, not at the caption"
+        assert r.y1 > 640, "crop still reaches the body text"
+        assert r in page.rect + (-1, -1, 1, 1), "crop stays inside the page"
     doc.close()
 
 
@@ -1202,7 +1262,7 @@ def test_graphic_rects_bucketing():
         (250.0, 250.0, 300.0, 300.0),
         (400.0, 400.0, 500.0, 500.0),
     ])
-    check("marks bucket, clip, normalize and union as expected", got == want)
+    assert got == want, "marks bucket, clip, normalize and union as expected"
 
     # The regression this whole change is about: cost per mark. 200k marks
     # through the old per-mark fitz.Rect loop took ~3.4s; vectorized it is
@@ -1216,8 +1276,8 @@ def test_graphic_rects_bucketing():
     rects = detect._graphic_rects(page)
     elapsed = time.perf_counter() - t0
     print(f"       ({len(bulk)} marks in {1000 * elapsed:.0f} ms)")
-    check("200k marks stay well under half a second", elapsed < 0.5)
-    check("...and still produce bucketed rects", 0 < len(rects) <= 64)
+    assert elapsed < 0.5, "200k marks stay well under half a second"
+    assert 0 < len(rects) <= 64, "...and still produce bucketed rects"
 
 
 def test_dense_figure_page_detects_promptly():
@@ -1234,8 +1294,7 @@ def test_dense_figure_page_detects_promptly():
     # size-independent.
     doc = fitz.open(DENSE_PDF)
     page = doc.load_page(0)
-    check("fixture really is mark-dense",
-          len(page.get_bboxlog()) >= DENSE_MARKS)
+    assert len(page.get_bboxlog()) >= DENSE_MARKS, "fixture really is mark-dense"
     t0 = time.perf_counter()
     page.get_bboxlog()
     bboxlog_cost = time.perf_counter() - t0
@@ -1251,13 +1310,13 @@ def test_dense_figure_page_detects_promptly():
     ratio = surcharge / bboxlog_cost if bboxlog_cost > 0 else 0.0
     print(f"       (detect {1000 * with_graphics:.0f} ms; figure pass costs "
           f"{ratio:.1f}x its own get_bboxlog)")
-    check("figure pass adds little over MuPDF's own enumeration", ratio < 2.5)
-    check("dense figure page still gets a content rect", r is not None)
+    assert ratio < 2.5, "figure pass adds little over MuPDF's own enumeration"
+    assert r is not None, "dense figure page still gets a content rect"
     if r is not None:
         # The plot spans x 120-420, y 90-270 (PDF y is measured from the
         # top here because insert_text/draw use top-left origin pages).
-        check("crop covers the whole dense plot",
-              r.x0 <= 121 and r.x1 >= 419 and r.y0 <= 91)
+        assert r.x0 <= 121 and r.x1 >= 419 and r.y0 <= 91, \
+            "crop covers the whole dense plot"
     doc.close()
 
 
@@ -1268,13 +1327,13 @@ def test_image_figure_counts_as_content():
     doc = fitz.open(IMAGE_FIGURE_PDF)
     page = doc.load_page(0)
     blocks = [b for b in page.get_text("blocks") if b[4].strip()]
-    check("only the caption is extractable as text", len(blocks) == 1)
-    check("caption sits below the image", blocks[0][1] > 340)
+    assert len(blocks) == 1, "only the caption is extractable as text"
+    assert blocks[0][1] > 340, "caption sits below the image"
     r = detect.detect_content_rect(page, allow_raster=False)
-    check("image figure page gets a content rect", r is not None)
+    assert r is not None, "image figure page gets a content rect"
     if r is not None:
-        check("crop starts at the image, not the caption", r.y0 < 100)
-        check("crop still reaches the caption", r.y1 > 355)
+        assert r.y0 < 100, "crop starts at the image, not the caption"
+        assert r.y1 > 355, "crop still reaches the caption"
     doc.close()
 
 
@@ -1300,10 +1359,9 @@ def test_graphic_detect_budget_stops_scanning():
             pump(20)
             if v._detect_pending_gen is None:
                 break
-        check("figure pass ran on the first pages", len(calls) >= 1)
-        check("figure pass stopped once the budget was spent",
-              len(calls) < 10)
-        check("the crop still landed", v.crop_rect is not None)
+        assert len(calls) >= 1, "figure pass ran on the first pages"
+        assert len(calls) < 10, "figure pass stopped once the budget was spent"
+        assert v.crop_rect is not None, "the crop still landed"
         v.close()
     finally:
         detect._graphic_rects = real
@@ -1328,10 +1386,10 @@ def test_failed_detection_still_zooms_out():
     try:
         v._zoom_focus = (v.first_page, 0.5, 0.5)
         v.zoom_in_step(); pump(60)
-        check("zoomed in before the recrop", v.crop_rect is not None)
+        assert v.crop_rect is not None, "zoomed in before the recrop"
         v.zoom_to_content_sampled(); pump(200)
-        check("failed detection drops the crop", v.crop_rect is None)
-        check("failed detection clears the crop source", v.crop_source_rect is None)
+        assert v.crop_rect is None, "failed detection drops the crop"
+        assert v.crop_source_rect is None, "failed detection clears the crop source"
     finally:
         tasks.detect_content_rect = orig
     v.close()
@@ -1345,14 +1403,14 @@ def test_detect_loading_dot_clears_when_superseded():
     pump(60)
     v.zoom_to_content_sampled()
     gen = v._detect_generation
-    check("detection is pending", v._detect_pending_gen == gen)
+    assert v._detect_pending_gen == gen, "detection is pending"
     v._zoom_focus = (v.first_page, 0.5, 0.5)
     v.zoom_in_step()  # manual crop: bumps _detect_generation past the result
-    check("manual crop superseded the detection", v._detect_generation != gen)
+    assert v._detect_generation != gen, "manual crop superseded the detection"
     pump(200)
-    check("pending marker cleared by the stale result", v._detect_pending_gen is None)
-    check("loading dot is out", not v._loading)
-    check("manual zoom survived the stale result", v.crop_rect is not None)
+    assert v._detect_pending_gen is None, "pending marker cleared by the stale result"
+    assert not v._loading, "loading dot is out"
+    assert v.crop_rect is not None, "manual zoom survived the stale result"
     v.close()
 
 
@@ -1364,24 +1422,25 @@ def test_busy_indicator_follows_the_page_numbers():
     v._update_status()
     v._loading = False
     v._render_status()
-    check("idle counter is the bare range", v.status_overlay.text() == v._status_text)
+    assert v.status_overlay.text() == v._status_text, "idle counter is the bare range"
     v._loading = True
     v._busy_frame = 0
     v._render_status()
     text = v.status_overlay.text()
-    check("busy counter still starts with the range", text.startswith(v._status_text))
-    check("first frame is drawn after the numbers",
-          constants.BUSY_FRAMES[0] in text[len(v._status_text):])
+    assert text.startswith(v._status_text), "busy counter still starts with the range"
+    assert constants.BUSY_FRAMES[0] in text[len(v._status_text):], \
+        "first frame is drawn after the numbers"
     v._advance_busy_frame()
     stepped = v.status_overlay.text()
-    check("a tick changes the frame", constants.BUSY_FRAMES[1] in stepped)
-    check("stepping still leaves the numbers first", stepped.startswith(v._status_text))
+    assert constants.BUSY_FRAMES[1] in stepped, "a tick changes the frame"
+    assert stepped.startswith(v._status_text), "stepping still leaves the numbers first"
     for _ in range(len(constants.BUSY_FRAMES) - 1):
         v._advance_busy_frame()
-    check("frames wrap back round", constants.BUSY_FRAMES[0] in v.status_overlay.text())
-    check("indicator steps twice a second", v._busy_timer.interval() == 500)
+    assert constants.BUSY_FRAMES[0] in v.status_overlay.text(), "frames wrap back round"
+    assert v._busy_timer.interval() == 500, "indicator steps twice a second"
     v._refresh_loading_indicator()
-    check("timer runs exactly while there is work", v._busy_timer.isActive() == v._loading)
+    assert v._busy_timer.isActive() == v._loading, \
+        "timer runs exactly while there is work"
     v.close()
 
 
@@ -1394,23 +1453,23 @@ def test_selection_uses_primary_and_ctrl_c_uses_clipboard():
     clipboard.setText("sentinel-from-elsewhere", QClipboard.Clipboard)
     v.cells[0].selections = [{"rects": [], "text": "selected words"}]
     v.on_selection_changed()
-    check("releasing a drag leaves the ordinary clipboard alone",
-          clipboard.text(QClipboard.Clipboard) == "sentinel-from-elsewhere")
+    assert clipboard.text(QClipboard.Clipboard) == "sentinel-from-elsewhere", \
+        "releasing a drag leaves the ordinary clipboard alone"
     if clipboard.supportsSelection():
         # Not the offscreen platform, but assert it where the platform has one.
-        check("the drag published the primary selection",
-              clipboard.text(QClipboard.Selection) == "selected words")
+        assert clipboard.text(QClipboard.Selection) == "selected words", \
+            "the drag published the primary selection"
     QTest.keyClick(v, Qt.Key_C, Qt.ControlModifier); pump()
-    check("Ctrl+C copies the selection to the ordinary clipboard",
-          clipboard.text(QClipboard.Clipboard) == "selected words")
+    assert clipboard.text(QClipboard.Clipboard) == "selected words", \
+        "Ctrl+C copies the selection to the ordinary clipboard"
 
     # A window-level shortcut would otherwise eat the search box's own Ctrl+C.
     v.focus_search_input(); pump()
     v.search_input.setText("query text")
     v.search_input.selectAll()
     v.copy_selection()
-    check("Ctrl+C in a text field copies the field, not the page",
-          clipboard.text(QClipboard.Clipboard) == "query text")
+    assert clipboard.text(QClipboard.Clipboard) == "query text", \
+        "Ctrl+C in a text field copies the field, not the page"
     v._on_escape(); pump()
     v.close()
 
@@ -1423,7 +1482,7 @@ def test_stale_generation_render_is_dropped():
     pump(60)
     cell = v.cells[0]
     crisp = cell._page_pixmap
-    check("cell has a render to protect", crisp is not None)
+    assert crisp is not None, "cell has a render to protect"
     size = cell.size()
     stale = QImage(size.width(), size.height(), QImage.Format_RGB888)
     stale.fill(Qt.red)
@@ -1433,12 +1492,11 @@ def test_stale_generation_render_is_dropped():
         size.width(), size.height(), v._crop_generation, v.dark_mode,
         v._dpr(), stale, None)
     v._on_render_done(result)
-    check("superseded generation does not repaint the cell",
-          cell._page_pixmap is crisp)
+    assert cell._page_pixmap is crisp, "superseded generation does not repaint the cell"
     # The in-flight count belongs to the current generation, so a stale
     # arrival must not decrement it -- that would strand the busy spinner.
-    check("superseded generation does not touch the in-flight count",
-          v._render_inflight == inflight)
+    assert v._render_inflight == inflight, \
+        "superseded generation does not touch the in-flight count"
     v.close()
 
 
@@ -1466,29 +1524,28 @@ def test_search_refine_keeps_one_back_target():
                 return True
         return False
 
-    check("first query matched", type_and_wait("Page 12"))
+    assert type_and_wait("Page 12"), "first query matched"
     first_landing = v.first_page
     depth_after_first = len(v._history)
     pos_after_first = v._history_pos
-    check("refined query matched", type_and_wait("Page 15"))
+    assert type_and_wait("Page 15"), "refined query matched"
     second_landing = v.first_page
-    check("refining moved the view again", second_landing != first_landing)
+    assert second_landing != first_landing, "refining moved the view again"
     # The heart of the fold: the refined landing REPLACES the previous one
     # rather than being pushed on top of it. Without this, Back/Forward walk
     # every intermediate match a reader typed through.
-    check("refining does not deepen the history",
-          len(v._history) == depth_after_first)
-    check("refining does not advance the history position",
-          v._history_pos == pos_after_first)
-    check("the history entry now holds the refined landing",
-          v._history[v._history_pos] == second_landing)
+    assert len(v._history) == depth_after_first, "refining does not deepen the history"
+    assert v._history_pos == pos_after_first, \
+        "refining does not advance the history position"
+    assert v._history[v._history_pos] == second_landing, \
+        "the history entry now holds the refined landing"
     QTest.keyClick(v, Qt.Key_Return); pump()
     v.history_back(); pump()
-    check("one Back returns to the pre-search page (not the first match)",
-          v.first_page == origin)
+    assert v.first_page == origin, \
+        "one Back returns to the pre-search page (not the first match)"
     v.history_forward(); pump()
-    check("Forward lands on the refined match, not the first one",
-          v.first_page == second_landing)
+    assert v.first_page == second_landing, \
+        "Forward lands on the refined match, not the first one"
     v.close()
 
 
@@ -1500,7 +1557,7 @@ def test_last_page_state_write_is_atomic():
     path = state._state_file_path()
     state._save_last_page("/tmp/doc_a.pdf", 4)
     state._save_last_page("/tmp/doc_b.pdf", 9)
-    check("both documents saved", state._load_last_page("/tmp/doc_b.pdf") == 9)
+    assert state._load_last_page("/tmp/doc_b.pdf") == 9, "both documents saved"
     before = open(path).read()
 
     # Fail the rename, i.e. after the temp file is fully written.
@@ -1510,15 +1567,16 @@ def test_last_page_state_write_is_atomic():
         state._save_last_page("/tmp/doc_c.pdf", 1)  # must not raise
     finally:
         os.replace = orig_replace
-    check("a failed save leaves the previous file byte-identical",
-          open(path).read() == before)
-    check("the earlier positions are still readable",
-          state._load_last_page("/tmp/doc_a.pdf") == 4)
+    assert open(path).read() == before, \
+        "a failed save leaves the previous file byte-identical"
+    assert state._load_last_page("/tmp/doc_a.pdf") == 4, \
+        "the earlier positions are still readable"
     leftovers = [f for f in os.listdir(os.path.dirname(path)) if f.endswith(".tmp")]
-    check("a failed save leaves no temp file behind", leftovers == [])
+    assert leftovers == [], "a failed save leaves no temp file behind"
     # And a normal save still lands.
     state._save_last_page("/tmp/doc_c.pdf", 1)
-    check("a later save succeeds normally", state._load_last_page("/tmp/doc_c.pdf") == 1)
+    assert state._load_last_page("/tmp/doc_c.pdf") == 1, \
+        "a later save succeeds normally"
 
 
 def test_entry_point_and_helper_prompt_paths():
@@ -1526,12 +1584,12 @@ def test_entry_point_and_helper_prompt_paths():
     # entry point's public surface (pdfviewer_xcb.py does `from pdfviewer
     # import main`) and the location of pdf_helper_prompt.txt, which is read
     # at the far end of a terminal launch where a wrong path is silent.
-    check("entry point still exports main", callable(pdfviewer.main))
-    check("entry point still exports PdfGridViewer",
-          pdfviewer.PdfGridViewer is window.PdfGridViewer)
-    check("pdfviewer_xcb.py's import still resolves",
-          "from pdfviewer import main" in open(
-              os.path.join(REPO_ROOT, "pdfviewer_xcb.py")).read())
+    assert callable(pdfviewer.main), "entry point still exports main"
+    assert pdfviewer.PdfGridViewer is window.PdfGridViewer, \
+        "entry point still exports PdfGridViewer"
+    assert "from pdfviewer import main" in open(
+        os.path.join(REPO_ROOT, "pdfviewer_xcb.py")).read(), \
+        "pdfviewer_xcb.py's import still resolves"
     # Ask the launcher what path it actually passes, rather than recomputing
     # it here -- recomputing would agree with a wrong implementation.
     captured = {}
@@ -1550,68 +1608,11 @@ def test_entry_point_and_helper_prompt_paths():
         integrations.subprocess.Popen = orig_popen
     inner = captured.get("argv", ["", "", "", "", ""])[-1]
     m = re.search(r"--append-system-prompt-file (\S+)", inner)
-    check("the launcher passes a helper-prompt path", m is not None)
-    check("the path it passes actually exists",
-          bool(m) and os.path.exists(m.group(1).strip("'\"")))
-
-
-def main():
-    tests = [
-        test_shortcuts_bound,
-        test_paging,
-        test_status_format,
-        test_busy_indicator_follows_the_page_numbers,
-        test_selection_uses_primary_and_ctrl_c_uses_clipboard,
-        test_grid_resize,
-        test_cursor_zoom,
-        test_zoom_out_from_content_crop_stays_in_page,
-        test_scanned_page_content_crop,
-        test_content_crop_keeps_figures,
-        test_graphic_rects_bucketing,
-        test_dense_figure_page_detects_promptly,
-        test_image_figure_counts_as_content,
-        test_graphic_detect_budget_stops_scanning,
-        test_failed_detection_still_zooms_out,
-        test_detect_loading_dot_clears_when_superseded,
-        test_collapse_and_restore,
-        test_recrop_after_collapse_single_render,
-        test_search_incremental_commit_escape,
-        test_search_no_match_red,
-        test_search_escape_cancels_inflight_result,
-        test_copy_window_inherits_crop,
-        test_copy_window_outlives_its_parent,
-        test_wayland_only_requested_in_a_wayland_session,
-        test_toc_fluid_nav_and_out,
-        test_toc_header_highlight_and_close,
-        test_toc_semicolon_toggle_and_no_toc_doc,
-        test_misc_no_crash,
-        test_dark_mode_pixel_math,
-        test_pixmap_cache_invariants,
-        test_stale_render_does_not_clobber,
-        test_history_back_and_clamp,
-        test_center_drag_pan_and_click,
-        test_citation_to_web_search,
-        test_search_jump_recorded_in_history,
-        test_ask_claude_launcher,
-        test_document_survives_file_moved,
-        test_buffer_survives_move_during_load,
-        test_encrypted_pdf_unlocks_everywhere,
-        test_stale_generation_render_is_dropped,
-        test_search_refine_keeps_one_back_target,
-        test_last_page_state_write_is_atomic,
-        test_entry_point_and_helper_prompt_paths,
-    ]
-    for t in tests:
-        print(f"\n== {t.__name__} ==")
-        t()
-    print("\n" + ("=" * 40))
-    if _failures:
-        print(f"FAILED ({len(_failures)}):")
-        for f in _failures:
-            print("  - " + f)
-        sys.exit(1)
-    print("ALL TESTS PASSED")
+    assert m is not None, "the launcher passes a helper-prompt path"
+    assert bool(m) and os.path.exists(m.group(1).strip("'\"")), \
+        "the path it passes actually exists"
 
 
 if __name__ == "__main__":
-    main()
+    # Convenience only -- `python -m pytest tests/` is the real entry point.
+    sys.exit(pytest.main([__file__, "-v"]))
