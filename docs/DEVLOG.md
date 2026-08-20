@@ -392,3 +392,34 @@ its smaller ones. `docs/REVIEW-2026-08.md` records what was declined and why.
   shouldn't be made to install a runner. No plugins; `pytest-qt` was considered
   and rejected, since `pump()` already models this program's thread pool and
   armed timers and `qtbot.wait*` does not.
+
+## 2026-08-19 (last) — session transcripts archived in the repo
+
+Addison asked for the Claude Code and Codex transcripts for this directory to
+be condensed into `docs/session_transcripts/`: an index plus one file per
+session, keeping only his messages and the final reply of each agent turn, with
+timestamps. 19 sessions, 2026-07-14 through 2026-08-19.
+
+- **Sources.** Claude Code sessions live as JSONL in
+  `~/.claude/projects/-home-addwc-a-study-tech-pdf-viewer/`; Codex sessions in
+  `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, which are *not* per-project —
+  the one belonging to this repo was found by its `cwd` in the `session_meta`
+  line. Exactly one Codex session (2026-08-17) matched.
+- **Three sessions have no transcript, including the one that first built the
+  viewer.** The project started at `~/a/study_tech/claude/simple_pdf_viewer`
+  and Claude Code keys its records by folder, so nothing survives under
+  `~/.claude/projects/` for that path — nor for two July 16 sessions that did
+  run here. Their user prompts were recovered from `~/.claude/history.jsonl`,
+  which stores every prompt with a timestamp, `project` path and `sessionId`
+  independently of the transcripts; the agents' replies are gone. Those files
+  are marked *prompts only*.
+- **What was kept.** Every user message; for each assistant turn only the last
+  text block before the next user message, which is the reply Addison actually
+  read. Tool calls, tool results, reasoning, sidechain (subagent) entries,
+  `isMeta` records, `<system-reminder>` blocks and local-command stdout are
+  dropped. Slash commands survive as one line (`/effort high`).
+- **Two sessions were dropped entirely** — a slash command and no reply.
+- **Files are named for the first message's timestamp** (`2026-07-17-1533-claude.md`),
+  which is unique across the set and stable if the archive is regenerated. An
+  earlier pass numbered them positionally; that renumbers everything whenever an
+  older session turns up, which is exactly what happened.

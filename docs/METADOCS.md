@@ -23,6 +23,10 @@ The raw record, and where measurements live. Searched, not read start to finish.
 **GOTCHAS.md** — library and platform behavior that has already cost debugging
 time here. A lookup, for when something behaves unexpectedly.
 
+**session_transcripts/** — condensed records of past agent sessions: Addison's
+messages and each agent's final reply, nothing else. Consulted when you need to
+know what he actually asked for; never a place to write to.
+
 ARCHITECTURE, HISTORY and this file are in every agent's context, so a wasted
 line in them is paid for repeatedly; keep them short. SUBSYSTEMS, DEVLOG and
 GOTCHAS are opened deliberately and can afford more length. `README.md`,
